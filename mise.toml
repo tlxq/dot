@@ -1,0 +1,17 @@
+# `mise run check` is what pre-push runs, `mise run format` what pre-commit runs.
+[tools]
+bats = "1.14.0"
+shellcheck = "0.11.0"
+gitleaks = "8.30.1"
+jq = "1.8.1"
+
+[tasks.check]
+description = "Everything pre-push runs: shellcheck and the bats tests"
+run = [
+  "shellcheck -S warning dot tools/public-guard",
+  "bats --jobs \"$(nproc)\" --no-parallelize-across-files tests",
+]
+
+[tasks.format]
+description = "Format the files given (pre-commit passes the staged ones and restages them)"
+run = "true"

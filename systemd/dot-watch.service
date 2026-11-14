@@ -1,0 +1,10 @@
+[Unit]
+Description=dot: fetch the dotfiles and ask the other PCs for their status
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/dot watch
+Nice=10
+IOSchedulingClass=idle

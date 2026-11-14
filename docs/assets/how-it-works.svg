@@ -1,0 +1,69 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1280 700" font-family="Inter, Segoe UI, Helvetica, Arial, sans-serif">
+  <rect width="1280" height="700" rx="16" fill="#24252a"/>
+  <defs><marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path d="M0 0 10 5 0 10z" fill="#8fb0ff"/></marker></defs>
+
+  <g fill="#f2f0ea" fill-opacity=".55" font-size="18" font-weight="600" letter-spacing="2">
+    <text x="60" y="62">THIS PC</text>
+    <text x="950" y="62">OTHER PC</text>
+  </g>
+
+  <g fill="none" stroke="#f2f0ea" stroke-opacity=".35" stroke-width="2">
+    <rect x="60" y="90" width="270" height="160" rx="12" stroke="#8fb0ff" stroke-opacity=".8"/>
+    <rect x="60" y="300" width="270" height="120" rx="12"/>
+    <rect x="505" y="90" width="270" height="160" rx="12"/>
+    <rect x="950" y="90" width="270" height="160" rx="12" stroke="#8fb0ff" stroke-opacity=".8"/>
+    <rect x="950" y="300" width="270" height="120" rx="12"/>
+  </g>
+
+  <g fill="#f2f0ea" font-size="26" font-weight="600">
+    <text x="84" y="134" fill="#8fb0ff">Dotfiles repo</text>
+    <text x="84" y="344">Home folder</text>
+    <text x="529" y="134">Git remote</text>
+    <text x="974" y="134" fill="#8fb0ff">Dotfiles repo</text>
+    <text x="974" y="344">Home folder</text>
+  </g>
+  <g fill="#f2f0ea" fill-opacity=".7" font-size="19">
+    <text x="84" y="166">stow packages, shared</text>
+    <text x="84" y="192">host-&lt;pc&gt; wins on this PC</text>
+    <text x="84" y="218">backups for dot undo</text>
+    <text x="84" y="376">symlinks into the repo</text>
+    <text x="84" y="402">post-link hooks</text>
+    <text x="529" y="166">GitHub or any git host</text>
+    <text x="529" y="192">signed commits only</text>
+    <text x="974" y="166">the same packages</text>
+    <text x="974" y="192">its own host-&lt;pc&gt;</text>
+    <text x="974" y="218">backups for dot undo</text>
+    <text x="974" y="376">symlinks into the repo</text>
+    <text x="974" y="402">post-link hooks</text>
+  </g>
+
+  <g fill="none" stroke="#8fb0ff" stroke-width="2.5" marker-end="url(#a)">
+    <path d="M330 170H501"/>
+    <path d="M775 170H946"/>
+    <path d="M195 250V296"/>
+    <path d="M1085 250V296"/>
+    <path d="M950 560H334"/>
+  </g>
+  <g fill="none" stroke="#f2f0ea" stroke-opacity=".35" stroke-width="2">
+    <path d="M195 420V560H334"/>
+    <path d="M1085 420V560H950"/>
+  </g>
+
+  <g fill="#f2f0ea" fill-opacity=".7" font-size="17">
+    <text x="345" y="156" fill="#8fb0ff">dot push</text>
+    <text x="345" y="200">secrets, lint and</text>
+    <text x="345" y="222">tests, then a</text>
+    <text x="345" y="244">signed commit</text>
+    <text x="790" y="156" fill="#8fb0ff">dot pull</text>
+    <text x="790" y="200">signatures,</text>
+    <text x="790" y="222">backup, rebase,</text>
+    <text x="790" y="244">link</text>
+    <text x="212" y="282">dot link (stow)</text>
+    <text x="1102" y="282">dot link</text>
+    <text x="370" y="595">dot watch, dot share-from, dot drift over ssh</text>
+    <text x="370" y="619">status, changed files and settings of the other PC</text>
+  </g>
+  <g fill="#f2f0ea" fill-opacity=".55" font-size="17">
+    <text x="60" y="672">A pull that clashes changes nothing: both sides are saved, and dot resolve fixes it in a separate copy.</text>
+  </g>
+</svg>

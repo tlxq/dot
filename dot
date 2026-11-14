@@ -1,0 +1,2146 @@
+#!/usr/bin/env bash
+# dot — keep one dotfiles repo (GNU stow packages) the same on several PCs.
+#
+#   dot                   fetch + show sync status
+#   dot status --json     sync status as JSON (local only, no fetch), for a status bar
+#   dot push [-m <msg>] [--no-check] [-- <path>...]  stage all (or only those paths), run dot check, commit, push
+#   dot pull              fetch, check signatures, back up, rebase onto origin (stops cleanly on a clash), relink, run hooks
+#   dot check [--all]     secrets, shellcheck, json, lua, tests on what's outgoing
+#   dot diff [--color]    everything dot push would share from this PC
+#   dot undo [<n>] [-y]   list the backups dot pull saves, or go back to one
+#   dot resolve [--show|--accept|--drop]  let Claude Code solve a stopped pull in a copy
+#   dot start push|pull|share-from|pick|revert [args]  run one in the background
+#   dot stop              stop it, while nothing is committed or changed yet
+#   dot job [--json|--log|--fix|--retry]  the running or last job: steps, result; --log opens its log,
+#                         --fix asks Claude Code, --retry repeats it exactly
+#   dot watch             fetch + ask the other PCs for their status over ssh (dot-watch.timer)
+#   dot share-from [<pc>] [-y]  show another PC's changes, then share them from there
+#   dot pick <path>... mine|theirs   both PCs changed the same files: keep one version on both
+#   dot revert <commit>   take one shared change back on both PCs
+#   dot drift             settings that differ from the other PC (system/drift/watch.txt)
+#   dot drift --json      the same as JSON (from dot watch's last look)
+#   dot drift sort <path> show the diff, then use one PC's on both, keep per PC
+#                         or stop watching (local signed commit)
+#   dot drift relink <path>  a watched file an app saved over its link: keep the
+#                         edit in the repo or use the repo version (backed up)
+#   dot link [pkg...]     stow packages (all discovered if none named) + hooks;
+#                         host-<this PC> is linked last and wins on shared files;
+#                         links into the repo that point nowhere are removed;
+#                         watched settings saved over their link are linked again
+#                         (backed up first when they differ)
+#   dot unlink <pkg>...   unstow packages
+#   dot add <pkg> <path>  move a $HOME file into <pkg> and restow
+#   dot keep-here <path>  make a shared file this PC's own: copy it into
+#                         host-<this PC>, put the shared one back, local commit
+#   dot edit              open the repo in $EDITOR
+#   dot doctor [--offline] health check (read-only; --offline skips git fetch)
+#   dot bootstrap         first-run setup on a fresh PC
+#   dot help              this help
+#
+# Env:
+#   DOTFILES / DOT       repo path            (default ~/.dotfiles)
+#   DOT_TARGET           stow target dir      (default $HOME)  — for testing
+#   DOT_HOST             this PC's name      (default /etc/hostname) — for testing
+#   DOT_SIGNERS          allowed signers file in the repo (default git/.config/git/allowed_signers)
+#   DOT_PULL_MODE        rebase|merge|ff-only (default rebase)
+#   DOT_NO_HOOKS=1       skip hooks on link/pull
+#   DOT_ALLOW_SECRET=1   skip only the secrets check
+#   DOT_CLAUDE           the Claude Code command for resolve and job --fix (default claude)
+set -euo pipefail
+
+DOT="${DOTFILES:-${DOT:-$HOME/.dotfiles}}"
+SIGNERS="${DOT_SIGNERS:-git/.config/git/allowed_signers}"
+TARGET="${DOT_TARGET:-$HOME}"
+
+# Commits are signed with an ssh key (gpg.format=ssh), which needs the agent.
+# A desktop shell, systemd units and non-interactive ssh may not export it.
+_agent="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ssh-agent.socket"
+if [ -z "${SSH_AUTH_SOCK:-}" ] && [ -S "$_agent" ]; then export SSH_AUTH_SOCK="$_agent"; fi
+unset _agent
+# The check tools (shellcheck, gitleaks, bats) come from mise, whose shims the
+# a status bar and systemd units may not have on PATH.
+[ -d "$HOME/.local/share/mise/shims" ] && PATH="$PATH:$HOME/.local/share/mise/shims"
+IGNORE_RE='^(hooks|system|tests|\.git|\.github)$'
+
+c_dim=$'\033[2m'; c_red=$'\033[31m'; c_yel=$'\033[33m'; c_grn=$'\033[32m'; c_rst=$'\033[0m'
+dim()  { printf '%s%s%s\n' "$c_dim" "$*" "$c_rst"; }
+warn() { printf '%s%s%s\n' "$c_yel" "$*" "$c_rst" >&2; }
+die()  { if [ -z "${JOB_MSG:-}" ]; then JOB_MSG=${*%%$'\n'*}; JOB_MSG=${JOB_MSG#dot *: }; fi; printf '%s%s%s\n' "$c_red" "$*" "$c_rst" >&2; exit 1; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# A git worktree of the repo shares it but never drives the links:
+# those always come from the main checkout.
+is_worktree() {
+  [ "$(git -C "$DOT" rev-parse --absolute-git-dir 2>/dev/null)" != \
+    "$(git -C "$DOT" rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" ]
+}
+no_worktree() {
+  is_worktree || return 0
+  die "dot $1: $DOT is a git worktree. Links always come from the main checkout; run it there."
+}
+
+# status --json reports a missing repo as JSON itself
+if [ ! -e "$DOT/.git" ] && [ "${1:-} ${2:-}" != "status --json" ]; then die "no dotfiles repo at $DOT"; fi
+
+# --- host layers -------------------------------------------------------------
+# A package named host-<hostname> is linked only on that PC, after the shared
+# packages, and wins where both have the same file: that's this PC's override.
+this_host() {
+  local h=${DOT_HOST:-$(cat /etc/hostname 2>/dev/null || hostname)}
+  printf '%s\n' "${h%%[[:space:]]*}"
+}
+host_pkg() { printf 'host-%s\n' "$(this_host)"; }
+
+# The files in this PC's host package as one stow regex, or nothing.
+host_regex() {
+  local hp files
+  hp="$DOT/$(host_pkg)"
+  [ -d "$hp" ] || return 0
+  files=$(cd "$hp" && find . \( -type f -o -type l \) -printf '%P\n' | sed 's/[][\.^$*+?(){}|]/\\&/g' | paste -sd'|')
+  [ -z "$files" ] || printf '^(%s)$\n' "$files"
+}
+
+# stow flags for one package: shared ones step aside for this PC's overrides,
+# the host package takes them over.
+stow_flags() {
+  local re
+  re=$(host_regex)
+  [ -n "$re" ] || return 0
+  if [ "$1" = "$(host_pkg)" ]; then printf '%s\n' "--override=$re"
+  else printf '%s\n' "--defer=$re"; fi
+}
+
+# --- package discovery -----------------------------------------------------
+# Every top-level dir, minus the ignore set, any line in $DOT/.dotignore and
+# the other PCs' host packages.
+discover() {
+  local d b
+  for d in "$DOT"/*/; do
+    b=${d%/}; b=${b##*/}
+    if [[ $b =~ $IGNORE_RE ]]; then continue; fi
+    if [[ $b == host-* && $b != "$(host_pkg)" ]]; then continue; fi
+    if [ -f "$DOT/.dotignore" ] && grep -qxF "$b" "$DOT/.dotignore"; then continue; fi
+    printf '%s\n' "$b"
+  done
+}
+
+# --- post-link hooks -----------------------------------------------------
+# A failing hook doesn't stop the others; the summary at the end names it and
+# the return code is 1 so callers can tell.
+run_hooks() {
+  local phase="$1"
+  local h dir="$DOT/hooks/$phase.d" total=0 failed=()
+  if [ -n "${DOT_NO_HOOKS:-}" ]; then dim "hooks: skipped (DOT_NO_HOOKS)"; return 0; fi
+  [ -d "$dir" ] || return 0
+  for h in "$dir"/*.sh; do
+    [ -e "$h" ] || continue
+    total=$((total + 1))
+    dim "hook: ${h##*/}"
+    DOTFILES="$DOT" DOT_TARGET="$TARGET" bash "$h" || failed+=("${h##*/}")
+  done
+  [ ${#failed[@]} -eq 0 ] && return 0
+  warn "dot link: linked, but ${#failed[@]} of $total hooks failed: ${failed[*]%.sh}"
+  warn "The other hooks ran. Run one alone to see why:"
+  warn "  bash $dir/${failed[0]}"
+  return 1
+}
+
+# --- staged-secret scan (push) ------------------------------------------
+# what a secret looks like (one extended regex, case-insensitive)
+secret_re() {
+  local re
+  re='(-----BEGIN [A-Z ]*PRIVATE KEY-----|AKIA[0-9A-Z]{16}|gh[pousr]_[0-9A-Za-z]{20,}'
+  re+='|AccountKey=[A-Za-z0-9+/=]{40,}|xox[baprs]-[0-9A-Za-z-]{10,}'
+  # JWTs (Supabase anon/service-role keys), OpenAI/Stripe/Anthropic style sk-… tokens
+  re+='|eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}|sk-(ant-|live-|test-)?[A-Za-z0-9_-]{20,}'
+  # key/value only: name, optional quote/space, a real ':' or '=', then a 12+ char value.
+  # A bare name in prose (e.g. "RESEND_API_KEY (server-only") no longer trips it.
+  re+='|(password|passwd|secret|token|api[_-]?key|client[_-]?secret|access[_-]?key|secret[_-]?key|private[_-]?key|service[_-]?role[_-]?key)["'"'"' ]{0,2}[:=]["'"'"' ]{0,2}[^[:space:]"'"'"']{12,})'
+  printf '%s\n' "$re"
+}
+
+secret_scan() {
+  local re added hits
+  re=$(secret_re)
+  # added lines only (skip the +++ file header), minus lock files
+  added=$(git -C "$DOT" diff --cached -U0 -- ':!*.lock' ':!*lazy-lock.json' | grep -E '^\+[^+]' || true)
+  if hits=$(printf '%s\n' "$added" | grep -nEi -e "$re"); then
+    printf '%s\n' "$hits"; return 1
+  fi
+}
+
+# --- running marker ------------------------------------------------------------
+# While pull or push runs, $XDG_RUNTIME_DIR/dot/running holds "<action> <pid>",
+# so `dot status --json` can say so ("running").
+RUN_DIR=""
+mark_running() {
+  local dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/dot"
+  mkdir -p "$dir" 2>/dev/null || return 0
+  printf '%s %s\n' "$1" "$$" >"$dir/running"
+  RUN_DIR=$dir
+  trap on_exit EXIT
+}
+
+on_exit() {
+  local rc=$?
+  [ -z "${1:-}" ] || rc=$1
+  job_finish "$rc"
+  [ -z "$RUN_DIR" ] || rm -f "$RUN_DIR/running"
+}
+
+# --- job progress ----------------------------------------------------------------
+# push and pull write their steps to $XDG_RUNTIME_DIR/dot/job.json (schema 1)
+# and everything they print to a log in $XDG_STATE_HOME/dot/logs (last 20 kept).
+# The file keeps the result after the job ends, until the next job starts.
+# Step times of finished jobs go to dot/job-times.tsv, for "about N min left".
+# `dot start` runs a job in the background, `dot stop` stops one while that is
+# still safe (before anything is committed or changed).
+JOB_FILE=""; JOB_ACTION=""; JOB_LOG=""; JOB_T0=0; JOB_DONE=0; JOB_STOPPED=0
+JOB_MSG=""; JOB_OK=""; JOB_KEY=""; JOB_STOP_MSG=""; JOB_REMOTE=""; JOB_REMOTE_SUMMARY=""
+job_path() { printf '%s/dot/job.json' "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"; }
+job_times() { printf '%s/dot/job-times.tsv' "${XDG_STATE_HOME:-$HOME/.local/state}"; }
+
+# job_write [jq args...] <filter>: apply a jq filter to job.json in place
+job_write() {
+  [ -n "$JOB_FILE" ] || return 0
+  if jq "$@" "$JOB_FILE" >"$JOB_FILE.$$" 2>/dev/null; then mv -f "$JOB_FILE.$$" "$JOB_FILE"
+  else rm -f "$JOB_FILE.$$"; fi
+  return 0
+}
+
+# job_begin <action> <id:label>...: start the progress file and the log
+job_begin() {
+  # pick and revert run a pull and a push inside: the job keeps their name, so
+  # dot job --retry repeats the pick or revert, not a bare push
+  local action=${DOT_JOB_ACTION:-$1} dir logs steps='[]' s now; shift
+  have jq || return 0
+  dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/dot"
+  logs="${XDG_STATE_HOME:-$HOME/.local/state}/dot/logs"
+  mkdir -p "$dir" "$logs" 2>/dev/null || return 0
+  now=$(date +%s); JOB_T0=$now; JOB_ACTION=$action
+  JOB_LOG="$logs/$(date +%Y%m%d-%H%M%S)-$action.log"
+  for s in "$@"; do
+    steps=$(jq -c --arg id "${s%%:*}" --arg l "${s#*:}" '. + [{id: $id, label: $l, state: "wait"}]' <<<"$steps")
+  done
+  JOB_FILE="$dir/job.json"
+  jq -n --arg a "$action" --argjson pid $$ --arg host "$(this_host)" --arg by "${DOT_JOB_BY:-}" \
+    --arg unit "${DOT_JOB_UNIT:-}" --argjson t "$now" --arg log "$JOB_LOG" --argjson steps "$steps" \
+    --arg args "${DOT_JOB_ARGS:-[]}" \
+    '{schema: 1, action: $a, args: ($args | try fromjson catch [] | if type == "array" then map(tostring) else [] end),
+      pid: $pid, host: $host, by: (if $by == "" then $host else $by end),
+      unit: $unit, startedAt: $t, endedAt: null, expectSec: null, stoppable: true, steps: $steps,
+      line: "", details: [], result: null, summary: "", log: $log}' >"$JOB_FILE.$$" &&
+    mv -f "$JOB_FILE.$$" "$JOB_FILE"
+  # shellcheck disable=SC2012
+  ls -1t "$logs"/*.log 2>/dev/null | tail -n +21 | xargs -r rm -f || true
+  trap job_term TERM INT
+  # a write to the log's tee after Stop ended it fails instead of killing dot
+  trap '' PIPE
+  exec > >(tee -a "$JOB_LOG") 2>&1
+}
+
+# job_step <id> <wait|run|ok|fail|skip> [done] [total]
+job_step() {
+  job_write --arg id "$1" --arg s "$2" --argjson now "$(date +%s)" --arg d "${3:-}" --arg n "${4:-}" '
+    .steps |= map(if .id == $id then
+      .state = $s
+      | (if $s == "run" and .startedAt == null then .startedAt = $now else . end)
+      | (if $s == "ok" or $s == "fail" or $s == "skip" then .endedAt = $now else . end)
+      | (if $d != "" then .done = ($d | tonumber) else . end)
+      | (if $n != "" then .total = ($n | tonumber) else . end)
+    else . end)'
+}
+# job_add_steps <id:label>...: more steps after job_begin
+job_add_steps() {
+  local s
+  for s in "$@"; do job_write --arg id "${s%%:*}" --arg l "${s#*:}" '.steps += [{id: $id, label: $l, state: "wait"}]'; done
+}
+job_label() { job_write --arg id "$1" --arg l "$2" '.steps |= map(if .id == $id then .label = $l else . end)'; }
+job_line() { job_write --arg l "$1" '.line = $l[0:200]'; }
+job_detail() { job_write --arg l "$1" '.details = (.details + [$l[0:200]])[0:8]'; }
+job_stoppable() { job_write --argjson v "$1" '.stoppable = $v'; }
+
+# job_expect <key>: the usual length of this kind of job (median of the last 5,
+# known after 2), for "about N min left"
+job_expect() {
+  [ -n "$JOB_FILE" ] || return 0
+  local m
+  JOB_KEY=$1
+  m=$(awk -F'\t' -v k="$1" '$1 == k { print $2 }' "$(job_times)" 2>/dev/null | tail -n 5 | sort -n |
+    awk '{ a[NR] = $1 } END { if (NR >= 2) print a[int((NR + 1) / 2)] }') || m=
+  if [ -n "$m" ]; then job_write --argjson e "$m" '.expectSec = $e'; fi
+  return 0
+}
+
+# from the EXIT trap: the result, and the time for next time's estimate
+job_finish() {
+  [ -n "$JOB_FILE" ] && [ "$JOB_DONE" = 0 ] || return 0
+  JOB_DONE=1
+  local rc=$1 now result summary
+  now=$(date +%s)
+  if [ "$JOB_STOPPED" = 1 ]; then result=stopped; summary="Stopped. ${JOB_STOP_MSG:-}"
+  elif [ "$rc" = 0 ]; then result=ok; summary=${JOB_OK:-Done}
+  else result=failed; summary=${JOB_MSG:-"dot $JOB_ACTION stopped (exit $rc)"}; fi
+  job_write --arg r "$result" --arg s "${summary% }" --argjson now "$now" '
+    .result = $r | .summary = $s | .endedAt = $now | .stoppable = false
+    | .steps |= map(if .state == "run" then
+        .state = ({ok: "ok", failed: "fail", stopped: "stop"}[$r]) | .endedAt = $now else . end)'
+  if [ "$result" = ok ] && [ -n "$JOB_KEY" ]; then
+    mkdir -p "$(dirname "$(job_times)")" && printf '%s\t%s\n' "$JOB_KEY" $((now - JOB_T0)) >>"$(job_times)"
+  fi
+  [ -z "${DOT_JOB_NOTIFY:-}" ] || job_notify "$result" "${summary% }" $((now - JOB_T0))
+  return 0
+}
+
+# A background job's ending as a desktop notification (notify-send), unless it
+# was stopped on purpose.
+job_notify() {
+  local result=$1 summary=$2 sec=$3 word
+  [ "$result" != stopped ] && have notify-send || return 0
+  case "$JOB_ACTION" in pull) word=Pull ;; *) word=Share ;; esac
+  if [ "$result" = ok ]; then
+    notify-send --app-name dot -u low "$summary" \
+      "Dotfiles · $(this_host) · $((sec / 60)):$(printf %02d $((sec % 60)))" >/dev/null 2>&1 || true
+  else
+    notify-send --app-name dot -u normal "$word stopped by a problem" \
+      "$summary See: dot job" >/dev/null 2>&1 || true
+  fi
+  return 0
+}
+
+# Stop asked for (dot stop / Ctrl-C). The children (bats, git) get the signal
+# too: dot stop signals the whole job, systemd stops the whole unit.
+job_term() {
+  trap '' TERM INT
+  # Stop ends the log's tee too: what dot says from here goes to the file
+  [ -z "${JOB_LOG:-}" ] || exec >>"$JOB_LOG" 2>&1
+  JOB_STOPPED=1
+  # share-from: the push runs on the other PC, so stop it there too
+  [ -z "${JOB_REMOTE:-}" ] || timeout 10 ssh -o BatchMode=yes -o ConnectTimeout=5 "$JOB_REMOTE" '$HOME/.local/bin/dot stop' >/dev/null 2>&1 || true
+  exit 143
+}
+
+# a job that hasn't finished and whose dot is still there
+job_running() {
+  local f pid
+  f=$(job_path)
+  [ -s "$f" ] && have jq || return 1
+  [ "$(jq -r '.result // "none"' "$f" 2>/dev/null)" = none ] || return 1
+  pid=$(jq -r '.pid // 0' "$f" 2>/dev/null)
+  kill -0 "$pid" 2>/dev/null
+}
+
+# lines from a command, printed and shown as the job's live line
+job_lines() {
+  local l
+  while IFS= read -r l; do printf '%s\n' "$l"; [ -z "$l" ] || job_line "$l"; done
+}
+
+cmd_start() {
+  local action="${1:-}" unit self v
+  case "$action" in push|pull|share|share-from|pick|revert) shift ;; *) die "usage: dot start push|pull|share|share-from|pick|revert [args]" ;; esac
+  have jq || die "dot start: needs jq"
+  if job_running; then die "dot start: dot $(jq -r .action "$(job_path)") is already running."; fi
+  self=$(readlink -f "$0")
+  unit="dot-$action-$(date +%s)"
+  if have systemd-run && [ -z "${DOT_START_INLINE:-}" ]; then
+    # the unit starts from the user manager's environment: carry over the
+    # settings this dot was started with
+    local env=(--setenv=PATH="$PATH" --setenv=DOTFILES="$DOT" --setenv=DOT_JOB_UNIT="$unit" --setenv=DOT_JOB_NOTIFY=1
+      --setenv=DOT_JOB_ARGS="$(jq -nc '$ARGS.positional' --args -- "$@")")
+    for v in DOT_JOB_BY DOT_TARGET DOT_HOST DOT_PULL_MODE DOT_NO_HOOKS XDG_STATE_HOME; do
+      [ -z "${!v:-}" ] || env+=(--setenv="$v=${!v}")
+    done
+    systemd-run --user --quiet --collect --unit "$unit" "${env[@]}" "$self" "$action" "$@"
+    dim "dot start: $action runs in the background ($unit). See it with: dot job"
+  else
+    DOT_JOB_UNIT="" DOT_JOB_NOTIFY=1 DOT_JOB_ARGS="$(jq -nc '$ARGS.positional' --args -- "$@")" \
+      setsid -f "$self" "$action" "$@" </dev/null >/dev/null 2>&1
+    dim "dot start: $action runs in the background. See it with: dot job"
+  fi
+}
+
+proc_tree() {
+  local c
+  for c in $(pgrep -P "$1" || true); do proc_tree "$c"; done
+  printf '%s\n' "$1"
+}
+
+cmd_stop() {
+  local f pid unit stoppable action pids=()
+  f=$(job_path)
+  if ! job_running; then dim "dot stop: nothing is running"; return 0; fi
+  pid=$(jq -r .pid "$f"); unit=$(jq -r '.unit // ""' "$f")
+  stoppable=$(jq -r .stoppable "$f"); action=$(jq -r .action "$f")
+  [ "$stoppable" = true ] || die "dot stop: dot $action is past the point where stopping is safe. It finishes in a moment."
+  if [ -n "$unit" ] && systemctl --user -q is-active "$unit" 2>/dev/null; then
+    systemctl --user stop "$unit"
+  else
+    # dot first, so its Stop handling is waiting when the step it runs ends,
+    # then everything under it
+    mapfile -t pids < <(proc_tree "$pid")
+    kill -TERM "$pid" 2>/dev/null || true
+    kill -TERM "${pids[@]}" 2>/dev/null || true
+  fi
+  dim "dot stop: stopped dot $action"
+}
+
+# dot job [--json|--log|--mark seen|dismissed|--fix|--retry]: the running or last job,
+# its log in less, a status bar's marks, or Claude Code on a failed one
+cmd_job() {
+  local f
+  f=$(job_path)
+  if [ "${1:-}" = --json ]; then
+    if [ -s "$f" ]; then cat "$f"; else echo '{"schema":1,"result":"none"}'; fi
+    return 0
+  fi
+  if [ "${1:-}" = --log ]; then
+    local log=""
+    [ -s "$f" ] && log=$(jq -r '.log // ""' "$f")
+    case "$log" in "${XDG_STATE_HOME:-$HOME/.local/state}"/dot/logs/*.log) ;; *) die "dot job: no log yet" ;; esac
+    [ -f "$log" ] || die "dot job: the log is gone ($log)"
+    exec less -R +G "$log"
+  fi
+  if [ "${1:-}" = --mark ]; then
+    # for a status bar: seen (it showed a failure) or dismissed
+    case "${2:-}" in seen|dismissed) ;; *) die "usage: dot job --mark seen|dismissed" ;; esac
+    [ -s "$f" ] && have jq || return 0
+    [ "$(jq -r '.result // "none"' "$f" 2>/dev/null)" != none ] || return 0
+    JOB_FILE=$f job_write --arg k "$2At" --argjson now "$(date +%s)" '.[$k] //= $now'
+    return 0
+  fi
+  if [ "${1:-}" = --fix ]; then job_fix; fi
+  if [ "${1:-}" = --retry ]; then
+    # the last job again, with exactly its options, in the background
+    local action args=()
+    [ -s "$f" ] && have jq || die "dot job: no job yet"
+    case "$(jq -r '.result // ""' "$f")" in failed|stopped) ;; *) die "dot job --retry: the last job didn't fail or stop" ;; esac
+    action=$(jq -r '.action // ""' "$f")
+    case "$action" in push|pull|share|pick|revert) ;; *) die "dot job --retry: can't repeat a $action job here" ;; esac
+    mapfile -t args < <(jq -r '(.args // [])[]' "$f")
+    exec "$0" start "$action" "${args[@]}"
+  fi
+  [ -s "$f" ] || { dim "dot job: no job yet"; return 0; }
+  jq -r '"dot \(.action) on \(.host)" + (if .by != .host then " (started from \(.by))" else "" end)
+    + ": " + (.result // "running") + (if .summary != "" then " · \(.summary)" else "" end),
+    (.steps[] | "  " + ({wait: "○", run: "◐", ok: "✓", fail: "✗", skip: "–", stop: "■"}[.state] // "?")
+      + " " + .label + (if .total then " \(.done // 0)/\(.total)" else "" end)),
+    (if .line != "" and .result == null then "  " + .line else empty end),
+    "  log: \(.log)"' "$f"
+}
+
+# dot job --fix: Claude Code in the repo with the failed job's step, problem and log
+job_fix() {
+  local f prompt
+  f=$(job_path)
+  [ -s "$f" ] && have jq || die "dot job: no job yet"
+  [ "$(jq -r '.result // ""' "$f")" = failed ] || die "dot job --fix: the last job didn't fail"
+  have "${DOT_CLAUDE:-claude}" || die "dot job --fix: claude isn't installed here"
+  prompt=$(jq -r '"`dot \(.action)` on \(.host) stopped by a problem: \(.summary)\n"
+    + ([.steps[] | select(.state == "fail") | .label] | if length > 0 then "It stopped at the step: \(.[0]).\n" else "" end)
+    + (if (.details | length) > 0 then "Details:\n" + (.details | map("- " + .) | join("\n")) + "\n" else "" end)
+    + "The full log is \(.log).\n\n"
+    + "Read the log, find the cause and fix it here in the dotfiles repo. Tell me what you changed and why. "
+    + "Do not commit, push or pull: I will run dot job --retry when it is fixed."' "$f")
+  cd "$DOT" || die "dot job --fix: no repo at $DOT"
+  exec "${DOT_CLAUDE:-claude}" "$prompt"
+}
+
+# --- backups (dot pull saves one, dot undo restores one) ----------------------
+# A backup is refs/dot/backup/<time> (HEAD), plus <time>-wip when there were
+# uncommitted edits (a `git stash create` commit; the files are left as they
+# are). Untracked files are never touched by a pull, so they aren't saved.
+BACKUP_NS=refs/dot/backup
+BACKUP_KEEP=20
+
+backup_names() {
+  git -C "$DOT" for-each-ref --sort=-refname --format='%(refname:lstrip=3)' "$BACKUP_NS/" \
+    | { grep -v -- '-wip$' || true; }
+}
+
+save_backup() {
+  local name wip n=2
+  name=$(date '+%Y%m%d-%H%M%S')
+  while git -C "$DOT" show-ref -q --verify "$BACKUP_NS/$name"; do name="${name%%.*}.$n"; n=$((n + 1)); done
+  git -C "$DOT" update-ref "$BACKUP_NS/$name" HEAD
+  wip=$(git -C "$DOT" stash create 2>/dev/null || true)
+  [ -z "$wip" ] || git -C "$DOT" update-ref "$BACKUP_NS/$name-wip" "$wip"
+  backup_names | tail -n +$((BACKUP_KEEP + 1)) | while read -r old; do
+    git -C "$DOT" update-ref -d "$BACKUP_NS/$old"
+    git -C "$DOT" update-ref -d "$BACKUP_NS/$old-wip" 2>/dev/null || true
+  done
+  saved_backup=$name
+}
+
+# "20261014-221503" -> "2026-10-14 22:15:03"
+backup_when() { local n="${1%%.*}"; printf '%s-%s-%s %s:%s:%s' "${n:0:4}" "${n:4:2}" "${n:6:2}" "${n:9:2}" "${n:11:2}" "${n:13:2}"; }
+
+# --- checks (dot check, and dot push before it commits) ------------------
+# Files that differ from GitHub's copy: commits not yet pushed, staged,
+# unstaged and new files. Deleted files are left out.
+outgoing_files() {
+  local base
+  base=$(git -C "$DOT" merge-base HEAD '@{u}' 2>/dev/null) || base=HEAD
+  { git -C "$DOT" diff --name-only "$base"; git -C "$DOT" ls-files --others --exclude-standard; } | sort -u
+}
+
+is_shell() {
+  case "${1##*/}" in *.sh|*.bash) return 0 ;; *.*) return 1 ;; esac
+  local line=""
+  IFS= read -r line <"$DOT/$1" 2>/dev/null || true
+  [[ $line =~ ^\#!.*[/\ ](ba|da)?sh([[:space:]]|$) ]]
+}
+
+cmd_check() {
+  local all=0 f rc=0 base out tmp n_commits=0
+  local files=() sh=() js=() lua=() tests=0
+  case "${1:-}" in --all) all=1 ;; "") ;; *) die "usage: dot check [--all]" ;; esac
+  _ok()   { printf '  %s✓%s %s\n' "$c_grn" "$c_rst" "$*"; job_line "✓ $*"; }
+  _skip() { printf '  %s–%s %s\n' "$c_dim" "$c_rst" "$*"; }
+  _bad()  { printf '  %s✗%s %s\n' "$c_red" "$c_rst" "$*"; rc=1; job_detail "$*"; }
+  _detail() { sed 's/^/      /'; }
+
+  if [ $all = 1 ]; then mapfile -t files < <(git -C "$DOT" ls-files)
+  elif [ -n "${CHECK_FILES+x}" ]; then mapfile -t files < <(sed '/^$/d' <<<"$CHECK_FILES")
+  else mapfile -t files < <(outgoing_files); fi
+  base=$(git -C "$DOT" merge-base HEAD '@{u}' 2>/dev/null) || base=HEAD
+  [ $all = 1 ] || n_commits=$(git -C "$DOT" rev-list --count "$base..HEAD")
+  for f in "${files[@]}"; do
+    [ -f "$DOT/$f" ] && [ ! -L "$DOT/$f" ] || continue
+    case "$f" in bootstrap.sh|hooks/*|tests/*) tests=1 ;; esac
+    case "$f" in *.json) js+=("$f") ;; *.lua) lua+=("$f") ;; esac
+    if is_shell "$f"; then sh+=("$f"); fi
+  done
+  if [ ${#files[@]} -eq 0 ] && [ "$n_commits" = 0 ]; then
+    dim "dot check: nothing outgoing to check"; job_step checks skip; job_step tests skip; return 0
+  fi
+  job_step checks run
+  echo "dot check: ${#files[@]} file(s)$([ $all = 1 ] && echo ', all of the repo' || echo ", $n_commits unpushed commit(s)")"
+
+  # secrets
+  if [ -n "${DOT_ALLOW_SECRET:-}" ]; then
+    _skip "secrets (DOT_ALLOW_SECRET is set)"
+  elif have gitleaks; then
+    tmp=$(mktemp -d); out=""
+    if [ $all = 1 ]; then
+      gitleaks git --no-banner --redact -l error -f json -r "$tmp/c.json" "$DOT" >/dev/null 2>&1 || true
+      gitleaks dir --no-banner --redact -l error -f json -r "$tmp/d.json" "$DOT" >/dev/null 2>&1 || true
+    else
+      if [ "$n_commits" != 0 ]; then
+        gitleaks git --no-banner --redact -l error --log-opts="$base..HEAD" -f json -r "$tmp/c.json" "$DOT" >/dev/null 2>&1 || true
+      fi
+      for f in "${files[@]}"; do
+        [ -f "$DOT/$f" ] || continue
+        gitleaks dir --no-banner --redact -l error -f json -r "$tmp/d.json" "$DOT/$f" >/dev/null 2>&1 || true
+        [ -s "$tmp/d.json" ] && jq -r --arg f "$f" '.[] | "\($f):\(.StartLine)  \(.RuleID)"' "$tmp/d.json" >>"$tmp/hits"
+        rm -f "$tmp/d.json"
+      done
+    fi
+    [ -s "$tmp/c.json" ] && jq -r '.[] | "\(.File):\(.StartLine)  \(.RuleID)  (commit \(.Commit[0:7]))"' "$tmp/c.json" >>"$tmp/hits"
+    [ -s "$tmp/d.json" ] && jq -r --arg d "$DOT/" '.[] | "\(.File | ltrimstr($d)):\(.StartLine)  \(.RuleID)"' "$tmp/d.json" >>"$tmp/hits"
+    [ -s "$tmp/hits" ] && out=$(sort -u "$tmp/hits")
+    rm -rf "$tmp"
+    if [ -n "$out" ]; then _bad "secrets: gitleaks found something that looks like a secret"; printf '%s\n' "$out" | _detail
+    else _ok "secrets (gitleaks)"; fi
+  elif out=$(secret_scan); then _ok "secrets (simple scan of staged lines; install gitleaks for more)"
+  else _bad "secrets: possible secret in staged changes"; printf '%s\n' "$out" | _detail; fi
+
+  # shell
+  if [ ${#sh[@]} -eq 0 ]; then :
+  elif ! have shellcheck; then _skip "shell: shellcheck not installed"
+  elif out=$(cd "$DOT" && shellcheck -S warning -f gcc "${sh[@]}" 2>&1); then _ok "shell (${#sh[@]} script(s))"
+  else _bad "shell: shellcheck warnings"; printf '%s\n' "$out" | _detail; fi
+
+  # json
+  if [ ${#js[@]} -gt 0 ]; then
+    out=""; for f in "${js[@]}"; do jq empty "$DOT/$f" >/dev/null 2>&1 || out+="$f"$'\n'; done
+    if [ -z "$out" ]; then _ok "json (${#js[@]} file(s))"; else _bad "json: not valid JSON"; printf '%s' "$out" | _detail; fi
+  fi
+
+  # lua (for example a Hyprland or Neovim config)
+  if [ ${#lua[@]} -gt 0 ]; then
+    if ! have luac; then _skip "lua: luac not installed"
+    else
+      out=""; for f in "${lua[@]}"; do out+=$(luac -p -- "$DOT/$f" 2>&1 | sed "s|$DOT/||") || true; done
+      if [ -z "$out" ]; then _ok "lua (${#lua[@]} file(s))"; else _bad "lua: syntax error"; printf '%s\n' "$out" | _detail; fi
+    fi
+  fi
+
+  job_step checks "$([ $rc = 0 ] && echo ok || echo fail)"
+
+  # the repo's own tests/ (bats), when hooks, bootstrap or the tests changed; side by side
+  # when GNU parallel is there (one by one takes minutes). Files run one after
+  # another: across files GNU parallel holds each file's results back until it
+  # ends, and the job counts them as they come.
+  if [ $tests = 1 ] || { [ $all = 1 ] && [ -d "$DOT/tests" ]; }; then
+    job_expect "$JOB_ACTION-tests"
+    if ! have bats; then _skip "tests: bats not installed"; job_step tests skip
+    elif [ ! -d "$DOT/tests" ]; then _skip "tests: no tests/ folder yet"; job_step tests skip
+    else
+      job_step tests run
+      local jobs par=()
+      jobs=$(test_jobs)
+      [ "$jobs" -lt 2 ] || par=(--jobs "$jobs" --no-parallelize-across-files)
+      if out=$(bats --tap "${par[@]}" "$DOT/tests" 2>&1 | tests_progress); then
+        _ok "tests ($(grep -c '^ok' <<<"$out") passed)"; job_step tests ok
+      else
+        _bad "tests: $(grep -c '^not ok' <<<"$out") failed"; grep -A3 '^not ok' <<<"$out" | _detail; job_step tests fail
+      fi
+    fi
+  else
+    job_expect "$JOB_ACTION"; job_step tests skip
+  fi
+  return $rc
+}
+
+test_jobs() { if have parallel; then nproc 2>/dev/null || echo 1; else echo 1; fi; }
+
+# bats --tap lines, passed through, counted into the job's tests step
+tests_progress() {
+  local l total="" n=0
+  while IFS= read -r l; do
+    printf '%s\n' "$l"
+    if [[ $l =~ ^1\.\.([0-9]+)$ ]]; then total=${BASH_REMATCH[1]}; job_step tests run 0 "$total"
+    elif [[ $l =~ ^(not ok|ok)\ ([0-9]+)\ (.*)$ ]]; then
+      n=$((n + 1))
+      job_step tests run "$n" "$total"
+      job_line "${BASH_REMATCH[1]} ${BASH_REMATCH[2]} · ${BASH_REMATCH[3]}"
+      [ "${BASH_REMATCH[1]}" = ok ] || job_detail "${BASH_REMATCH[3]}"
+    fi
+  done
+}
+
+# Fetch, then ask each other PC (system/hosts/pcs.txt) for its
+# `dot status --json` over ssh, into $XDG_RUNTIME_DIR/dot/hosts.json, which
+# `dot status --json` merges in. An offline PC keeps its last known status.
+# Run by dot-watch.timer every few minutes; fine to run by hand.
+cmd_watch() {
+  local dir="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/dot" me now fetch_ok=false
+  local prev='{}' hosts='{}' name alias st rc online err entry
+  mkdir -p "$dir"
+  exec 9>"$dir/watch.lock"
+  flock -n 9 || { dim "dot watch: already running"; return 0; }
+  me=$(this_host)
+  now=$(date +%s)
+  git -C "$DOT" fetch -q 2>/dev/null && fetch_ok=true
+  if [ -s "$dir/hosts.json" ] && jq -e . "$dir/hosts.json" >/dev/null 2>&1; then prev=$(cat "$dir/hosts.json"); fi
+
+  while read -r name alias _; do
+    case "$name" in ""|"#"*) continue ;; esac
+    [ "${name,,}" = "${me,,}" ] && continue
+    if st=$(timeout 15 ssh -o BatchMode=yes -o ConnectTimeout=3 "$alias" '$HOME/.local/bin/dot status --json' 2>/dev/null); then rc=0; else rc=$?; fi
+    online=true err=""
+    case "$rc" in
+      255|124) online=false err="unreachable" ;;
+      *) jq -e .schema >/dev/null 2>&1 <<<"$st" || { err="no 'dot status --json' there (old dot?)"; st=""; } ;;
+    esac
+    # the other PC's status carries its own copy of the host cache; drop it, or
+    # each PC would nest the other's copy one level deeper every run
+    entry=$(printf '%s' "$st" | jq -nc --argjson prev "$(jq -c --arg n "$name" '.hosts[$n] // {}' <<<"$prev")" \
+      --argjson now "$now" --argjson online "$online" --arg err "$err" --arg alias "$alias" '
+      (try input catch null | if type == "object" then del(.hosts, .watch) else null end) as $s
+      | {alias: $alias, online: $online, checkedAt: $now,
+         lastSeen: (if $online then $now else ($prev.lastSeen // null) end),
+         error: (if $err == "" then null else $err end),
+         status: ($s // ($prev.status | if type == "object" then del(.hosts, .watch) else null end))}')
+    hosts=$(jq -c --arg n "$name" --argjson e "$entry" '. + {($n): $e}' <<<"$hosts")
+    if [ "$online" = true ]; then dim "dot watch: $name online, $(jq -r '.status.state // "?"' <<<"$entry")"
+    else dim "dot watch: $name offline"; fi
+  done < <(cat "$DOT/system/hosts/pcs.txt" 2>/dev/null || true)
+
+  jq -n --argjson now "$now" --arg me "$me" --argjson ok "$fetch_ok" --argjson hosts "$hosts" \
+    '{schema: 1, host: $me, checkedAt: $now, fetch: {ok: $ok, at: $now}, hosts: $hosts}' >"$dir/hosts.json.tmp"
+  mv "$dir/hosts.json.tmp" "$dir/hosts.json"
+  [ "$fetch_ok" = true ] || warn "dot watch: couldn't fetch the remote; incoming changes may be out of date"
+  return 0
+}
+
+# dot pick <path>... mine|theirs: both PCs changed the same shared files, keep one version
+# on both. The version that goes is
+# saved in ~/.local/state/dot/picked/<time>/ first.
+#  theirs: drop this PC's edit, then pull what the other PC shared.
+#  mine:   ask the other PC to drop its edit (if it has one and is online), pull
+#          anything already shared, put this PC's version back on top and share it.
+PICKED="${XDG_STATE_HOME:-$HOME/.local/state}/dot/picked"
+cmd_pick() {
+  no_worktree pick
+  [ $# -ge 2 ] || die "usage: dot pick <path>... mine|theirs"
+  local which="${!#}" rels=() p rel dir name alias q=""
+  case "$which" in mine|theirs) ;; *) die "usage: dot pick <path>... mine|theirs" ;; esac
+  for p in "${@:1:$#-1}"; do
+    rel=$(realpath -m --relative-to="$DOT" -- "$p" 2>/dev/null)
+    case "$rel" in ""|..*|/*) rel=$p ;; esac
+    git -C "$DOT" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 || die "dot pick: $rel isn't a shared file in $DOT"
+    rels+=("$rel"); q+=" $(printf %q "$rel")"
+  done
+  if job_running; then die "dot pick: a $(jq -r .action "$(job_path)") is running. Try again when it's done."; fi
+  DOT_JOB_ACTION=pick
+  dir="$PICKED/$(date +%Y%m%d-%H%M%S)"
+  for rel in "${rels[@]}"; do
+    mkdir -p "$dir/$(dirname "$rel")"
+    [ -e "$DOT/$rel" ] && cp -p -- "$DOT/$rel" "$dir/$rel"
+  done
+  git -C "$DOT" restore --source=HEAD --staged --worktree -- "${rels[@]}"
+  if [ "$which" = theirs ]; then
+    dim "dot pick: dropped this PC's ${rels[*]} (saved in ${dir/#$HOME/\~})"
+    git -C "$DOT" fetch -q 2>/dev/null || true
+    if [ "$(git -C "$DOT" rev-list --count 'HEAD..@{u}')" -gt 0 ]; then cmd_pull; fi
+    return 0
+  fi
+  while read -r name alias _; do
+    case "$name" in ""|"#"*) continue ;; esac
+    [ "${name,,}" = "$(this_host | tr '[:upper:]' '[:lower:]')" ] && continue
+    if timeout 30 ssh -o BatchMode=yes -o ConnectTimeout=3 "$alias" "\$HOME/.local/bin/dot pick-drop$q" >/dev/null 2>&1; then
+      dim "dot pick: $name dropped its own edits"
+    else warn "dot pick: couldn't reach $name; its own edits stay there until it's online"; fi
+  done < <(cat "$DOT/system/hosts/pcs.txt" 2>/dev/null || true)
+  git -C "$DOT" fetch -q 2>/dev/null || true
+  if [ "$(git -C "$DOT" rev-list --count 'HEAD..@{u}')" -gt 0 ]; then ( cmd_pull ) || die "dot pick: the pull stopped, so nothing was shared. Your versions are in ${dir/#$HOME/\~}"; fi
+  for rel in "${rels[@]}"; do [ -e "$dir/$rel" ] && cp -p -- "$dir/$rel" "$DOT/$rel"; done
+  cmd_push -m "Keep $(this_host)'s version of ${rels[*]} on both PCs" -- "${rels[@]/#/$DOT/}"
+}
+
+# the other PC's half of `dot pick mine`: save and drop the uncommitted edit
+cmd_pick_drop() {
+  local rel dir
+  dir="$PICKED/$(date +%Y%m%d-%H%M%S)"
+  for rel in "$@"; do
+    git -C "$DOT" ls-files --error-unmatch -- "$rel" >/dev/null 2>&1 || die "dot pick-drop: $rel isn't a shared file"
+    git -C "$DOT" diff --quiet HEAD -- "$rel" && continue
+    mkdir -p "$dir/$(dirname "$rel")"
+    cp -p -- "$DOT/$rel" "$dir/$rel"
+    git -C "$DOT" restore --source=HEAD --staged --worktree -- "$rel"
+  done
+}
+
+# dot revert <commit>: take one shared change back on both PCs (a new signed
+# commit that undoes it, then shared).
+cmd_revert() {
+  no_worktree revert
+  local c="${1:-}" subj
+  [ -n "$c" ] && git -C "$DOT" cat-file -e "$c^{commit}" 2>/dev/null || die "usage: dot revert <commit>"
+  git -C "$DOT" merge-base --is-ancestor "$c" HEAD || die "dot revert: $c isn't on this PC"
+  if job_running; then die "dot revert: a $(jq -r .action "$(job_path)") is running. Try again when it's done."; fi
+  DOT_JOB_ACTION=revert
+  subj=$(git -C "$DOT" log -1 --format=%s "$c")
+  local files=()
+  mapfile -t files < <(git -C "$DOT" show --name-only --format= "$c")
+  git -C "$DOT" diff --quiet HEAD -- "${files[@]}" 2>/dev/null \
+    || die "dot revert: a file in that change is edited here right now. Nothing was changed."
+  if ! git -C "$DOT" revert --no-edit "$c" >/dev/null 2>&1; then
+    git -C "$DOT" revert --abort 2>/dev/null || true
+    die "dot revert: later changes build on it, so it can't be taken back by itself. Nothing was changed."
+  fi
+  git -C "$DOT" commit -q --amend -m "Undo: $subj" --trailer "Dot-Host: $(this_host)"
+  cmd_push
+}
+
+cmd_status() {
+  case "${1:-}" in
+    --json) status_json; return ;;
+    "") ;;
+    *) die "usage: dot status [--json]" ;;
+  esac
+  git -C "$DOT" fetch -q 2>/dev/null || true
+  git -C "$DOT" -c color.ui=always status -sb
+}
+
+# Local only (no fetch, no ssh), so a status bar can poll it.
+# Incoming = what the last fetch saw; lastFetch says how old that is. Always
+# prints one JSON object; on a broken repo it has "error" and the exit code is 1.
+STATUS_SCHEMA=1
+# last change time of a repo file (epoch), empty when it's gone
+mtime() { stat -c %Y -- "$DOT/$1" 2>/dev/null || true; }
+
+status_json() {
+  local files_in="" files_out="" rules=""
+  local host now gitdir rec t xy path from ab="" upstream="" branch="" op=null
+  local files=() fetched=null hosts_file=/dev/null hosts_age=null signers_tmp="" commits_in commits_out
+  host=$(this_host)
+  now=$(date +%s)
+  if ! gitdir=$(git -C "$DOT" rev-parse --absolute-git-dir 2>/dev/null); then
+    jq -nc --argjson v $STATUS_SCHEMA --arg h "$host" --arg r "$DOT" --argjson t "$now" \
+      '{schema:$v, host:$h, generatedAt:$t, repo:$r, error:"no dotfiles repo"}'
+    return 1
+  fi
+
+  # one git status call: branch, upstream, ahead/behind and every changed file
+  while IFS= read -r -d '' rec; do
+    case "$rec" in
+      "# branch.head "*) branch=${rec#"# branch.head "} ;;
+      "# branch.upstream "*) upstream=${rec#"# branch.upstream "} ;;
+      "# branch.ab "*) ab=${rec#"# branch.ab "} ;;
+      "#"*) ;;
+      "? "*) path=${rec#"? "}; files+=(new . "?" "$path" "" "$(mtime "$path")") ;;
+      1\ *) read -r t xy _ _ _ _ _ _ path <<<"$rec"; files+=(changed "${xy:0:1}" "${xy:1:1}" "$path" "" "$(mtime "$path")") ;;
+      2\ *) read -r t xy _ _ _ _ _ _ _ path <<<"$rec"; IFS= read -r -d '' from
+             files+=(renamed "${xy:0:1}" "${xy:1:1}" "$path" "$from" "$(mtime "$path")") ;;
+      u\ *) read -r t xy _ _ _ _ _ _ _ _ path <<<"$rec"; files+=(conflict "${xy:0:1}" "${xy:1:1}" "$path" "" "$(mtime "$path")") ;;
+    esac
+  done < <(git -C "$DOT" status --porcelain=v2 --branch -z --untracked-files=all)
+
+  if [ -d "$gitdir/rebase-merge" ] || [ -d "$gitdir/rebase-apply" ]; then op='"rebase"'
+  elif [ -f "$gitdir/MERGE_HEAD" ]; then op='"merge"'; fi
+  [ -f "$gitdir/FETCH_HEAD" ] && fetched=$(stat -c %Y "$gitdir/FETCH_HEAD")
+  local running=null run_action run_pid
+  local runfile="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/dot/running"
+  if [ -s "$runfile" ] && read -r run_action run_pid <"$runfile" && kill -0 "$run_pid" 2>/dev/null; then
+    case "$run_action" in pull|push|undo) running="\"$run_action\"" ;; esac
+  fi
+  local cache="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/dot/hosts.json"
+  if [ -s "$cache" ] && jq -e . "$cache" >/dev/null 2>&1; then
+    hosts_file=$cache; hosts_age=$(( now - $(stat -c %Y "$cache") ))
+  fi
+
+  # commits: hash, short, author, date, signature (G = signed by a trusted key), subject
+  local fmt='%H%x1f%h%x1f%an%x1f%at%x1f%G?%x1f%s%x1e'
+  if [ -n "$upstream" ]; then
+    head_signers || true
+    commits_in=$(git -C "$DOT" ${signers_tmp:+-c gpg.ssh.allowedSignersFile="$signers_tmp"} \
+      log -n 50 --format="$fmt" 'HEAD..@{u}' 2>/dev/null || true)
+    [ -n "$signers_tmp" ] && rm -f "$signers_tmp"
+    commits_out=$(git -C "$DOT" log -n 50 --format="$fmt" '@{u}..HEAD' 2>/dev/null || true)
+    files_in=$(git -C "$DOT" diff --name-only 'HEAD...@{u}' 2>/dev/null || true)
+    files_out=$(git -C "$DOT" diff --name-only '@{u}...HEAD' 2>/dev/null || true)
+  fi
+  # a pull that stopped on a clash, and Claude's fix for it (dot resolve)
+  local conflict=null cdir cwt="$DOT-resolve" csolving=false cready=false cup csolved=null
+  if cdir=$(open_conflict); then
+    if [ -d "$cwt" ]; then
+      csolving=true
+      cup=$(jq -r .upstream "$cdir/info.json")
+      if [ ! -d "$(git -C "$cwt" rev-parse --git-path rebase-merge 2>/dev/null)" ] &&
+         git -C "$cwt" merge-base --is-ancestor "$cup" HEAD 2>/dev/null; then cready=true; fi
+    fi
+    [ -f "$cdir/RESOLUTION.md" ] && csolved=$(stat -c %Y "$cdir/RESOLUTION.md")
+    conflict=$(jq -c --argjson s "$csolving" --argjson r "$cready" --argjson t "$csolved" \
+      '{at: .at, files: .files, solving: $s, ready: $r, solvedAt: $t}' "$cdir/info.json" 2>/dev/null || echo null)
+  fi
+  # files with a merge rule (.gitattributes, literal paths): they never stop a pull
+  [ -f "$DOT/.gitattributes" ] &&
+    rules=$(awk '!/^#/ && / merge=(union|lazylock)( |$)/ {print $1}' "$DOT/.gitattributes")
+
+  jq -nc \
+    --argjson v $STATUS_SCHEMA --arg host "$host" --argjson now "$now" --arg repo "$DOT" \
+    --arg branch "$branch" --arg upstream "$upstream" --arg ab "$ab" --argjson op "$op" \
+    --argjson fetched "$fetched" --argjson running "$running" --slurpfile hostsf "$hosts_file" --argjson hostsAge "$hosts_age" \
+    --arg cin "${commits_in:-}" --arg cout "${commits_out:-}" \
+    --argjson drift "$(drift_json 2>/dev/null || echo null)" \
+    --arg fin "$files_in" --arg fout "$files_out" --arg rules "$rules" --argjson conflict "$conflict" \
+    --arg today "$(git -C "$DOT" log -n 12 --since=midnight --format='%H%x1f%ct%x1f%(trailers:key=Dot-Host,valueonly,separator=)%x1f%s%x1e' 2>/dev/null || true)" \
+    --args '
+    def commits: split("\u001e") | map(ltrimstr("\n") | select(length > 0) | split("\u001f")
+      | {hash: .[0], short: .[1], author: .[2], date: (.[3] | tonumber), signature: .[4], subject: .[5]});
+    def lines: split("\n") | map(select(length > 0));
+    def chunks($n): . as $a | range(0; length; $n) | $a[.:. + $n];
+    def kind($t; $x; $y): if $t == "new" or $t == "conflict" or $t == "renamed" then $t
+      elif ($x + $y | test("D")) then "deleted" elif ($x + $y | test("A")) then "added" else "modified" end;
+    ($hostsf[0] // null) as $hosts
+    | ($ab | capture("\\+(?<a>[0-9]+) -(?<b>[0-9]+)") // {a: "0", b: "0"}) as $abn
+    | ($abn.a | tonumber) as $ahead | ($abn.b | tonumber) as $behind
+    | [$ARGS.positional | chunks(6) | {path: .[3], kind: kind(.[0]; .[1]; .[2]),
+        staged: (.[1] != "." and .[1] != "?"), unstaged: (.[2] != "."),
+        from: (if .[4] == "" then null else .[4] end),
+        changedAt: (if .[5] == "" then null else (.[5] | tonumber) end)}] as $files
+    | ($cin | commits) as $in
+    | {
+        schema: $v, host: $host, generatedAt: $now, repo: $repo,
+        branch: $branch, upstream: (if $upstream == "" then null else $upstream end),
+        state: (if $op != null then "in-progress"
+                elif any($files[]; .kind == "conflict") then "conflict"
+                elif $upstream == "" then "no-upstream"
+                elif $ahead > 0 and $behind > 0 then "diverged"
+                elif $behind > 0 then "behind"
+                elif $ahead > 0 then "ahead"
+                elif ($files | length) > 0 then "dirty"
+                else "clean" end),
+        operation: $op,
+        running: $running,
+        ahead: $ahead, behind: $behind,
+        lastFetch: $fetched, lastFetchAgeSec: (if $fetched == null then null else $now - $fetched end),
+        dirty: $files,
+        incoming: $in,
+        incomingUntrusted: ([$in[] | select(.signature != "G")] | length),
+        outgoing: ($cout | commits),
+        incomingFiles: ($fin | lines),
+        outgoingFiles: ($fout | lines),
+        mergeRules: ($rules | lines),
+        conflict: $conflict,
+        today: ($today | split("\u001e") | map(ltrimstr("\n") | select(length > 0) | split("\u001f")
+          | (.[3] | capture("^(sync|share|keep)\\((?<h>[^)]+)\\): ") // {h: null}).h as $sh
+          | {hash: .[0], at: (.[1] | tonumber), host: (if .[2] != "" then (.[2] | rtrimstr("\n")) else $sh end),
+             subject: (.[3] | sub("^(sync|share|keep)\\([^)]*\\): "; "") | sub(" — [0-9-]+ [0-9:]+$"; ""))})),
+        drift: $drift,
+        hosts: ($hosts.hosts // null),
+        watch: (if $hosts == null then null
+                else {checkedAt: $hosts.checkedAt, fetchOk: $hosts.fetch.ok, ageSec: $hostsAge} end)
+      }' "${files[@]}"
+}
+
+# Links under $TARGET that point into the repo at something that's gone (a
+# package or file removed on the other PC). Volatile state/cache trees are
+# skipped (mise etc. keep their own realpath links in there).
+dead_links() {
+  local l t
+  find "$TARGET" -maxdepth 6 \
+      \( -path '*/.local/state/*' -o -path '*/.cache/*' -o -path '*/.git/*' \
+         -o -path '*/node_modules/*' \) -prune -o -type l -print 2>/dev/null \
+    | while read -r l; do
+        [ -e "$l" ] && continue
+        t=$(readlink "$l" 2>/dev/null) || continue
+        [[ $t == /* ]] || t=$(realpath -ms -- "$(dirname -- "$l")/$t")
+        case "$t" in "$DOT"/*) printf '%s\n' "$l" ;; esac
+      done || true
+}
+
+cmd_link() {
+  no_worktree link
+  have stow || die "GNU stow not installed"
+  local pkgs=("$@")
+  if [ ${#pkgs[@]} -eq 0 ]; then mapfile -t pkgs < <(discover); fi
+  [ ${#pkgs[@]} -gt 0 ] || die "no packages to link"
+  drift_adopt "${pkgs[@]}"
+  stow_pkgs "${pkgs[@]}"
+  local l
+  while read -r l; do
+    [ -n "$l" ] || continue
+    rm -f -- "$l" && dim "removed dead link: ${l#"$TARGET"/}"
+  done < <(dead_links)
+  run_hooks post-link
+}
+
+# stow shared packages first, then this PC's host package over them
+stow_pkgs() {
+  local p shared=() mine="" flags=()
+  for p in "$@"; do
+    if [[ $p != host-* ]]; then shared+=("$p")
+    elif [ "$p" = "$(host_pkg)" ]; then mine=$p
+    else die "dot link: $p is only linked on ${p#host-}. This PC is $(this_host)."; fi
+  done
+  dim "stow: $*"
+  if [ ${#shared[@]} -gt 0 ]; then
+    mapfile -t flags < <(stow_flags shared)
+    stow -R "${flags[@]}" -d "$DOT" -t "$TARGET" "${shared[@]}" || die "stow failed — run 'dot doctor'"
+  fi
+  if [ -n "$mine" ]; then
+    mapfile -t flags < <(stow_flags "$mine")
+    stow -R "${flags[@]}" -d "$DOT" -t "$TARGET" "$mine" || die "stow failed — run 'dot doctor'"
+  fi
+}
+
+# --- drift between PCs -------------------------------------------------------
+# A short list of settings (system/drift/watch.txt) is compared between the PCs.
+# Each PC's `dot status --json` carries a fingerprint per watched file, so the
+# comparison rides on dot watch; file contents only travel when you ask for
+# the first difference (dot drift --json) or sort a file.
+DRIFT_LIST="$DOT/system/drift/watch.txt"
+DRIFT_PATH_RE='^[A-Za-z0-9_.][A-Za-z0-9_./+-]*$'
+
+drift_paths() {
+  local p
+  [ -f "$DRIFT_LIST" ] || return 0
+  while IFS= read -r p || [ -n "$p" ]; do
+    p="${p%%#*}"; p="${p//[[:space:]]/}"
+    [ -n "$p" ] || continue
+    [[ $p =~ $DRIFT_PATH_RE && $p != *..* ]] || continue
+    printf '%s\n' "$p"
+  done <"$DRIFT_LIST"
+}
+
+# the linked package that has this file: this PC's host package wins
+drift_repo_pkg() {
+  local p
+  if [ -f "$DOT/$(host_pkg)/$1" ]; then host_pkg; return 0; fi
+  for p in $(discover); do
+    [[ $p == host-* ]] && continue
+    [ -f "$DOT/$p/$1" ] && { printf '%s\n' "$p"; return 0; }
+  done
+  return 1
+}
+
+# one line per watched file: path, sha (16 hex or ""), link (shared|host|none|other|missing), repo (pkg or "")
+drift_entries() {
+  local p f t link sha repo
+  while IFS= read -r p; do
+    f="$TARGET/$p"
+    sha="" repo=""
+    repo=$(drift_repo_pkg "$p") || repo=""
+    if [ -L "$f" ]; then
+      t=$(readlink -f -- "$f" 2>/dev/null || true)
+      case "$t" in
+        "$DOT"/host-*) link=host ;;
+        "$DOT"/*) link=shared ;;
+        *) link=other ;;
+      esac
+    elif [ -f "$f" ]; then link=none
+    else link=missing; fi
+    if [ -f "$f" ]; then sha=$(sha256sum -- "$f" | cut -c1-16); fi
+    printf '%s\t%s\t%s\t%s\n' "$p" "$sha" "$link" "$repo"
+  done < <(drift_paths)
+}
+
+drift_json() {
+  drift_entries | jq -Rnc '[inputs | split("\t") | {path: .[0], sha: (if .[1] == "" then null else .[1] end),
+    link: .[2], repo: (if .[3] == "" then null else .[3] end)}]'
+}
+
+# Where to back up a file dot replaces (state dir, one folder per run).
+drift_backup() {
+  local f="$1" dir
+  dir="${XDG_STATE_HOME:-$HOME/.local/state}/dot/drift-backup/$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$dir/$(dirname -- "$2")"
+  cp -p -- "$f" "$dir/$2"
+  printf '%s\n' "$dir/$2"
+}
+
+# Before stowing: a watched setting that an app (or a system update) saved as a plain
+# file over its link is put back as a link. Same content: silently. Different:
+# backed up first, and the backup is named.
+drift_adopt() {
+  local p f pkg b
+  while IFS= read -r p; do
+    f="$TARGET/$p"
+    [ -f "$f" ] && [ ! -L "$f" ] || continue
+    pkg=$(drift_repo_pkg "$p") || continue
+    grep -qxF "$pkg" < <(printf '%s\n' "$@") || continue
+    if cmp -s -- "$f" "$DOT/$pkg/$p"; then rm -f -- "$f"; continue; fi
+    b=$(drift_backup "$f" "$p")
+    rm -f -- "$f"
+    warn "dot link: $p differed from the repo and was replaced by the link. Your copy: ${b/#"$HOME"/\~}"
+  done < <(drift_paths)
+}
+
+drift_other() {   # first other PC in pcs.txt: "name alias"
+  local me name alias
+  me=$(this_host)
+  while read -r name alias _; do
+    case "$name" in ""|"#"*) continue ;; esac
+    [ "${name,,}" = "${me,,}" ] && continue
+    [[ $alias =~ ^[A-Za-z0-9._-]+$ ]] || continue
+    printf '%s %s\n' "$name" "$alias"; return 0
+  done < <(cat "$DOT/system/hosts/pcs.txt" 2>/dev/null || true)
+  return 1
+}
+
+# grep -q stops reading at the first match; fed from a pipe, that could kill
+# drift_paths mid-list (SIGPIPE) and, with pipefail, read as "not on the list"
+drift_on_watch() { grep -qxF -- "$1" < <(drift_paths); }
+
+# the other PC's copy of a watched file, into $2 (exit 1 = can't reach, 2 = not there)
+drift_fetch() {
+  local alias="$1" p="$2" out="$3" rc
+  if timeout 10 ssh -o BatchMode=yes -o ConnectTimeout=3 "$alias" "\$HOME/.local/bin/dot drift --cat $p" >"$out" 2>/dev/null; then return 0; else rc=$?; fi
+  [ "$rc" = 3 ] && return 2
+  return 1
+}
+
+# "font-size 9 here · 8 on laptop", or "12 lines differ"
+drift_first_diff() {
+  local a="$1" b="$2" pc="$3"
+  { diff -- "$a" "$b" || true; } | awk -v pc="$pc" '
+    /^</ { n++; if (l == "") l = substr($0, 3) }
+    /^>/ { n++; if (r == "") r = substr($0, 3) }
+    END {
+      if (l != "" && r != "") {
+        kl = l; sub(/^[[:space:]]+/, "", kl); split(kl, x, /[[:space:]]*[=:][[:space:]]*|[[:space:]]+/)
+        kr = r; sub(/^[[:space:]]+/, "", kr); split(kr, y, /[[:space:]]*[=:][[:space:]]*|[[:space:]]+/)
+        if (x[1] == y[1] && x[1] != "") {
+          vl = substr(kl, length(x[1]) + 1); sub(/^[[:space:]]*[=:]?[[:space:]]*/, "", vl)
+          vr = substr(kr, length(y[1]) + 1); sub(/^[[:space:]]*[=:]?[[:space:]]*/, "", vr)
+          if (length(vl) <= 24 && length(vr) <= 24 && n == 2) { printf "%s %s here · %s on %s\n", x[1], vl, vr, pc; exit }
+        }
+      }
+      printf "%d line%s differ%s\n", n, (n == 1 ? "" : "s"), (n == 1 ? "s" : "")
+    }'
+}
+
+# rows: the other PC's last known fingerprints (from dot watch) vs here
+drift_rows_json() {
+  local name alias here st online asof old=false detail="${1:-}" rows tmp p d
+  read -r name alias < <(drift_other) || { jq -nc '{schema: 1, pcs: []}'; return 0; }
+  here=$(drift_json)
+  local cache="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/dot/hosts.json"
+  st=$(jq -c --arg n "$name" '.hosts[$n] // null' "$cache" 2>/dev/null || echo null)
+  online=$(jq -r '.online // false' <<<"$st")
+  asof=$(jq -r '.lastSeen // .status.generatedAt // "null"' <<<"$st")
+  jq -e '.status != null and .status.drift == null' >/dev/null <<<"$st" && old=true
+  rows=$(jq -nc --argjson here "$here" --argjson st "$st" '
+    ($st.status.drift // null) as $there
+    | if $there == null then [] else
+      ($there | map({(.path): .}) | add // {}) as $t
+      | [$here[] | . as $h | ($t[$h.path] // {path: $h.path, sha: null, link: "missing"}) as $o
+         | if $h.link == "host" or $o.link == "host" then empty
+           elif $h.link == "none" and $h.repo != null then {path: $h.path, state: "unlinked"}
+           elif $h.sha == null and $o.sha == null then empty
+           elif $o.sha == null then {path: $h.path, state: "only-here"}
+           elif $h.sha == null then {path: $h.path, state: "only-there"}
+           elif $h.sha != $o.sha and ($h.link != "shared" or $o.link != "shared") then {path: $h.path, state: "differs"}
+           else empty end]
+      end')
+  if [ "$detail" = detail ] && [ "$online" = true ] && jq -e 'any(.[]; .state == "differs")' >/dev/null <<<"$rows"; then
+    tmp=$(mktemp -d)
+    while IFS= read -r p; do
+      if drift_fetch "$alias" "$p" "$tmp/there"; then
+        d=$(drift_first_diff "$TARGET/$p" "$tmp/there" "$name")
+        rows=$(jq -c --arg p "$p" --arg d "$d" 'map(if .path == $p then . + {detail: $d} else . end)' <<<"$rows")
+      fi
+    done < <(jq -r '.[] | select(.state == "differs") | .path' <<<"$rows")
+    rm -rf "$tmp"
+  fi
+  jq -nc --arg n "$name" --argjson on "$online" --argjson asof "$asof" --argjson old "$old" --argjson rows "$rows" \
+    '{schema: 1, pcs: [{name: $n, online: $on, asOf: $asof, oldDot: $old, rows: $rows}]}'
+}
+
+drift_list_text() {
+  local j
+  j=$(drift_rows_json detail)
+  jq -r '.pcs[] | if .oldDot then "Update dot on \(.name) to compare settings (dot pull there)."
+    elif (.rows | length) == 0 then "Nothing differs from \(.name)."
+    else "Differs from \(.name)\(if .online then "" else " (offline, last known)" end):",
+      (.rows[] | "  \(.path)  " + (if .state == "unlinked" then "no longer linked · edited here"
+        elif .state == "only-here" then "only on this PC" elif .state == "only-there" then "only on the other PC"
+        else (.detail // "differs") end)) end' <<<"$j"
+}
+
+# put $src into package $pkg as $p, link it here, commit $p (+ extra paths)
+drift_store() {
+  local pkg="$1" p="$2" src="$3"
+  mkdir -p "$(dirname -- "$DOT/$pkg/$p")"
+  cp -- "$src" "$DOT/$pkg/$p"
+}
+
+drift_commit() {
+  local msg="$1"; shift
+  git -C "$DOT" add -- "$@"
+  if git -C "$DOT" diff --cached --quiet -- "$@"; then dim "The repo already had this. Nothing to commit."; return 0; fi
+  git -C "$DOT" commit -q -m "$msg" -- "$@" \
+    || die "dot drift: the files are saved, but the commit failed (signing?). Commit them with: dot push"
+  printf '%s%s%s\n' "$c_grn" "Committed here, not pushed. Share it with: dot push" "$c_rst"
+}
+
+drift_replace_here() {   # back up the plain file here (if any), then link $p from the repo
+  local p="$1" f="$TARGET/$1" b
+  if [ -f "$f" ] && [ ! -L "$f" ]; then
+    b=$(drift_backup "$f" "$p"); rm -f -- "$f"; dim "your copy here: ${b/#"$HOME"/\~}"
+  fi
+  local all; mapfile -t all < <(discover); stow_pkgs "${all[@]}"
+  [ -L "$f" ] || die "dot drift: $p is saved in the repo, but the link didn't appear — run 'dot doctor'"
+}
+
+drift_package_for() {   # an existing shared package with the file, or ask for one
+  local p="$1" pkg def
+  pkg=$(drift_repo_pkg "$p") && [[ $pkg != host-* ]] && { printf '%s\n' "$pkg"; return 0; }
+  case "$p" in
+    .config/*/*) def="${p#.config/}"; def="${def%%/*}" ;;
+    *) def=$(basename -- "$p"); def="${def#.}"; def="${def%%.*}" ;;
+  esac
+  read -r -p "Save it in which package? [$def] " pkg || pkg=""
+  pkg="${pkg:-$def}"
+  [[ $pkg =~ ^[a-z0-9][a-z0-9_-]*$ && $pkg != host-* ]] || die "dot drift: '$pkg' isn't a package name (a-z, 0-9, - and _). Nothing was changed."
+  printf '%s\n' "$pkg"
+}
+
+drift_gitdir_ok() {
+  local gitdir
+  gitdir=$(git -C "$DOT" rev-parse --absolute-git-dir)
+  if [ -d "$gitdir/rebase-merge" ] || [ -d "$gitdir/rebase-apply" ] || [ -f "$gitdir/MERGE_HEAD" ]; then
+    die "dot drift: a pull is half done. Finish it first ('dot resolve' or 'dot undo'). Nothing was changed."
+  fi
+}
+
+drift_target() {   # $1 = path, or --from-bar (the path in $XDG_RUNTIME_DIR/dot/drift-target); prints a path on the watch list
+  local p="$1"
+  if [ "$p" = --from-bar ]; then
+    p=$(head -c 512 "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/dot/drift-target" 2>/dev/null | head -n1) || p=""
+  fi
+  p="${p/#\~\//}"; p="${p#"$TARGET"/}"; p="${p#"$HOME"/}"
+  [[ $p =~ $DRIFT_PATH_RE && $p != *..* ]] && drift_on_watch "$p" \
+    || die "dot drift: '$p' isn't on the watch list (system/drift/watch.txt)."
+  printf '%s\n' "$p"
+}
+
+drift_sort() {
+  local p name alias tmp rc ans pkg me f choice
+  no_worktree drift
+  p=$(drift_target "${1:-}")
+  drift_gitdir_ok
+  read -r name alias < <(drift_other) || die "dot drift: no other PC in system/hosts/pcs.txt"
+  me=$(this_host); f="$TARGET/$p"
+  tmp=$(mktemp -d)
+  if drift_fetch "$alias" "$p" "$tmp/there"; then rc=0; else rc=$?; fi
+  [ "$rc" = 1 ] && rm -rf "$tmp" && die "Can't reach $name, so nothing was changed. Try again when it's on."
+  [ "$rc" = 2 ] && rm -f "$tmp/there"
+  [ -f "$f" ] && cp -- "$f" "$tmp/here"
+
+  printf '%s differs between %s (here) and %s\n\n' "$p" "$me" "$name"
+  if [ -f "$tmp/here" ] && [ -f "$tmp/there" ]; then
+    diff -u --color=always --label "$me: $p" --label "$name: $p" -- "$tmp/here" "$tmp/there" || true
+  elif [ -f "$tmp/here" ]; then echo "It's only on this PC."
+  else echo "It's only on $name."; fi
+  echo
+  [ -f "$tmp/here" ] && echo "  1  Use this PC's on both"
+  [ -f "$tmp/there" ] && echo "  2  Use $name's on both"
+  [ -f "$tmp/here" ] && [ -f "$tmp/there" ] && echo "  3  Keep per PC (each PC's copy saved in git)"
+  echo "  4  Stop watching this file"
+  echo "  q  Leave it"
+  read -r -p "> " ans || ans=q
+  case "$ans" in
+    1) [ -f "$tmp/here" ] || ans=q; choice="$tmp/here" ;;
+    2) [ -f "$tmp/there" ] || ans=q; choice="$tmp/there" ;;
+    3) { [ -f "$tmp/here" ] && [ -f "$tmp/there" ]; } || ans=q ;;
+    4) ;;
+    *) ans=q ;;
+  esac
+  case "$ans" in
+    1|2)
+      pkg=$(drift_package_for "$p")
+      drift_store "$pkg" "$p" "$choice"
+      drift_replace_here "$p"
+      drift_commit "drift($me): $p from $([ "$ans" = 1 ] && echo "$me" || echo "$name") on both" "$pkg/$p"
+      dim "$name links it on its next pull (its own copy is backed up there)." ;;
+    3)
+      drift_store "host-$me" "$p" "$tmp/here"
+      drift_store "host-$name" "$p" "$tmp/there"
+      drift_replace_here "$p"
+      drift_commit "drift($me): $p kept per PC" "host-$me/$p" "host-$name/$p"
+      dim "$name links its copy on its next pull." ;;
+    4)
+      local keep; keep=$(grep -vxF -- "$p" "$DRIFT_LIST")
+      printf '%s\n' "$keep" >"$DRIFT_LIST"
+      drift_commit "drift($me): stop watching $p" "system/drift/watch.txt" ;;
+    *) dim "Left as it is. Nothing was changed." ;;
+  esac
+  rm -rf "$tmp"
+}
+
+# a watched file that's a plain file here although the repo has it
+drift_relink() {
+  local p pkg f ans b
+  no_worktree drift
+  p=$(drift_target "${1:-}")
+  drift_gitdir_ok
+  f="$TARGET/$p"
+  pkg=$(drift_repo_pkg "$p") || die "dot drift: the repo has no $p to link."
+  [ -f "$f" ] && [ ! -L "$f" ] || die "dot drift: $p is already linked."
+  printf '%s is no longer linked: something saved its own copy over the link.\n\n' "$p"
+  diff -u --color=always --label "repo: $p" --label "here: $p" -- "$DOT/$pkg/$p" "$f" || true
+  echo
+  echo "  1  Keep this edit in the repo"
+  echo "  2  Use the repo version"
+  echo "  q  Leave it"
+  read -r -p "> " ans || ans=q
+  case "$ans" in
+    1|2)
+      b=$(drift_backup "$f" "$p")
+      [ "$ans" = 1 ] && cp -- "$f" "$DOT/$pkg/$p"
+      rm -f -- "$f"
+      local all; mapfile -t all < <(discover); stow_pkgs "${all[@]}"
+      dim "your copy is backed up: ${b/#"$HOME"/\~}"
+      if [ "$ans" = 1 ]; then echo "The edit is in the repo now. Share it with: dot push"
+      else echo "Linked to the repo version again."; fi ;;
+    *) dim "Left as it is. Nothing was changed." ;;
+  esac
+}
+
+cmd_drift() {
+  case "${1:-}" in
+    "") drift_list_text ;;
+    --json) drift_rows_json "${2:-}" ;;
+    --cat)
+      local p="${2:-}"
+      [[ $p =~ $DRIFT_PATH_RE && $p != *..* ]] && drift_on_watch "$p" || exit 4
+      [ -f "$TARGET/$p" ] || exit 3
+      head -c 262144 -- "$TARGET/$p" ;;
+    sort) shift; drift_sort "$@" ;;
+    relink) shift; drift_relink "$@" ;;
+    *) die "usage: dot drift [--json [detail]] | dot drift sort|relink <path>" ;;
+  esac
+}
+
+cmd_unlink() {
+  no_worktree unlink
+  have stow || die "GNU stow not installed"
+  [ $# -ge 1 ] || die "usage: dot unlink <pkg>..."
+  stow -D -d "$DOT" -t "$TARGET" "$@"
+  dim "unlinked: $*"
+}
+
+# fetch, then integrate @{u} locally. Never leaves the repo mid-rebase/merge,
+# and never lets an autostash land with conflict markers (git exits 0 then).
+# Every incoming commit must be signed by a key in allowed_signers as committed
+# at HEAD here, so a commit pushed to GitHub can't vouch for itself.
+# allowed_signers as committed at HEAD, copied to a temp file (path in $signers_tmp).
+head_signers() {
+  signers_tmp=$(mktemp)
+  git -C "$DOT" show "HEAD:$SIGNERS" >"$signers_tmp" 2>/dev/null && [ -s "$signers_tmp" ] && return 0
+  rm -f "$signers_tmp"; signers_tmp=""; return 1
+}
+
+verify_incoming() {
+  local tmp bad d="${DOT/#$HOME/\~}" signers_tmp
+  if ! head_signers; then
+    die "dot pull: stopped. This PC has no committed $SIGNERS, so incoming commits can't be checked. Nothing was changed."
+  fi
+  tmp=$signers_tmp
+  bad=$(git -C "$DOT" -c gpg.ssh.allowedSignersFile="$tmp" \
+    log --format='%G? %h %an: %s' 'HEAD..@{u}' 2>/dev/null | grep -v '^G ' || true)
+  rm -f "$tmp"
+  [ -z "$bad" ] && return 0
+  warn "dot pull: stopped. These incoming commits aren't signed by a key this PC trusts:"
+  printf '%s\n' "$bad" | sed 's/^. /  /' >&2
+  die "Nothing was changed. If they're yours (a new key, or made on GitHub), check them first:
+  git -C $d log --show-signature HEAD..@{u}
+Then take them by hand:  git -C $d rebase @{u}"
+}
+
+# --- conflicts (dot pull saves both sides; dot resolve lets Claude solve them) ---
+# A pull that clashes is undone as before, but first both sides of each file
+# are saved in $CONFLICTS/<time>/ with info.json and prompt.md. `dot resolve`
+# replays the pull in a worktree ($DOT-resolve) and starts Claude there, so the
+# live config never sees conflict markers. A conflict stays open until a pull
+# goes through, or its fix is accepted.
+CONFLICTS="${XDG_STATE_HOME:-$HOME/.local/state}/dot/conflict"
+CONFLICTS_KEEP=10
+
+# newest conflict folder that is still open, or nothing
+open_conflict() {
+  local dirs=("$CONFLICTS"/*/) i dir
+  for ((i = ${#dirs[@]} - 1; i >= 0; i--)); do
+    dir=${dirs[i]%/}
+    [ -f "$dir/info.json" ] || continue
+    [ -e "$dir/closed" ] && continue
+    printf '%s\n' "$dir"; return 0
+  done
+  return 1
+}
+
+close_conflicts() {
+  local dir
+  for dir in "$CONFLICTS"/*/; do [ -f "$dir/info.json" ] && [ ! -e "$dir/closed" ] && : >"$dir/closed"; done
+  return 0
+}
+
+# Called with the rebase/merge still stopped: saves each file's base, this PC's
+# and the incoming version from the index, the commits on both sides, and the
+# prompt for Claude. $1 = rebase|merge, then the conflicting paths.
+capture_conflict() {
+  local mode=$1; shift
+  local at dir head upstream f name here_stage in_stage me
+  at=$(date '+%Y%m%d-%H%M%S')
+  dir="$CONFLICTS/$at"
+  mkdir -p "$dir/files"
+  me=$(this_host)
+  # HEAD and @{u} as they were before the pull (mid-rebase HEAD is detached)
+  head=$pull_head; upstream=$pull_up
+  # in a rebase, stage 2 is the incoming side and 3 this PC's commit; a merge is the other way
+  if [ "$mode" = rebase ]; then here_stage=3; in_stage=2; else here_stage=2; in_stage=3; fi
+  for f in "$@"; do
+    name=${f//\//__}
+    git -C "$DOT" show ":1:$f" >"$dir/files/$name.base" 2>/dev/null || rm -f "$dir/files/$name.base"
+    git -C "$DOT" show ":$here_stage:$f" >"$dir/files/$name.this-pc" 2>/dev/null || echo "(deleted on this PC)" >"$dir/files/$name.this-pc"
+    git -C "$DOT" show ":$in_stage:$f" >"$dir/files/$name.incoming" 2>/dev/null || echo "(deleted on the other PC)" >"$dir/files/$name.incoming"
+  done
+  jq -n --arg at "$at" --arg mode "$mode" --arg host "$me" --arg head "$head" --arg upstream "$upstream" \
+    --arg here "$(git -C "$DOT" log --format='%h %s' "$upstream..$head" -- "$@")" \
+    --arg in "$(git -C "$DOT" log --format='%h %s' "$head..$upstream" -- "$@")" \
+    '{at: $at, mode: $mode, host: $host, head: $head, upstream: $upstream, files: $ARGS.positional,
+      commitsHere: ($here | split("\n") | map(select(length > 0))),
+      commitsIncoming: ($in | split("\n") | map(select(length > 0)))}' --args "$@" >"$dir/info.json"
+  write_prompt "$dir"
+  ls -1d "$CONFLICTS"/*/ 2>/dev/null | head -n -$CONFLICTS_KEEP | while read -r old; do rm -rf -- "$old"; done
+  dim "dot pull: saved both sides in $dir"
+}
+
+write_prompt() {
+  local dir=$1 wt="$DOT-resolve" at upstream host
+  at=$(jq -r .at "$dir/info.json"); upstream=$(jq -r .upstream "$dir/info.json"); host=$(jq -r .host "$dir/info.json")
+  {
+    echo "You're solving a dotfiles merge conflict for the user, in a separate working copy."
+    echo
+    echo "Where: $wt, a git worktree of $DOT on branch resolve/$at. A rebase of this PC's ($host) commits onto the incoming ones (${upstream:0:7}, from the other PC via GitHub) is in progress there and has stopped on a conflict."
+    echo
+    echo "Files both PCs changed:"
+    jq -r '.files[] | "- " + .' "$dir/info.json"
+    echo
+    echo "Each side is saved in $dir/files/ as <path with / as __>.base, .this-pc and .incoming."
+    echo
+    echo "Commits on this PC ($host) that touch them:"
+    jq -r '.commitsHere[] | "- " + .' "$dir/info.json"
+    echo
+    echo "Incoming commits (the other PC) that touch them:"
+    jq -r '.commitsIncoming[] | "- " + .' "$dir/info.json"
+    echo
+    echo "Rules:"
+    echo "- Work only in $wt. Never touch $DOT, never push, never run dot push, dot pull or dot link."
+    echo "- Change only the conflicting files. Remove every conflict marker."
+    echo "- Keep each PC's own settings separate: if a difference is about one machine (monitors, keyboard, hardware, paths that exist on one PC only), don't blend it into the shared file. Say so instead, and keep the incoming version for now."
+    echo "- Keep what both sides meant where you can. If they truly contradict, ask the user before choosing."
+    echo "- To go on: git add the files, then: GIT_EDITOR=true git rebase --continue (commits are signed automatically). Repeat if the rebase stops again."
+    echo "- When the rebase is done, write a short explanation per file to $dir/RESOLUTION.md: what each side wanted and what you kept."
+    echo "- Then show: git diff $upstream HEAD, and stop. The user accepts with 'dot resolve --accept' or drops it with 'dot resolve --drop'."
+  } >"$dir/prompt.md"
+}
+
+# --- merge rules (.gitattributes) ----------------------------------------------
+# Files that both PCs change often get a rule, so a pull doesn't stop on them:
+#   merge=union     keep both sides' lines (git built-in)
+#   merge=lazylock  nvim's lazy-lock.json, per plugin: a side that didn't change
+#                   it gives way; if both changed it, the incoming one wins
+# The lazylock driver lives in git config, so every pull (re)sets it.
+merge_drivers() {
+  local self want
+  self=$(readlink -f "$0")
+  want="'$self' merge-lazylock %O %A %B"
+  [ "$(git -C "$DOT" config --get merge.lazylock.driver 2>/dev/null)" = "$want" ] && return 0
+  git -C "$DOT" config merge.lazylock.name "lazy-lock.json: per plugin, incoming wins"
+  git -C "$DOT" config merge.lazylock.driver "$want"
+}
+
+# Files with a merge rule never stop a pull, so drop them from a clash list.
+without_merge_rule() {
+  local f
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    case "$(git -C "$DOT" check-attr merge -- "$f")" in
+      *": merge: union"|*": merge: lazylock") ;;
+      *) printf '%s\n' "$f" ;;
+    esac
+  done
+}
+
+# git merge driver: base, current (result goes here), other.
+# In a rebase the current side is the incoming one; in a merge it's this PC's.
+cmd_merge_lazylock() {
+  [ $# -eq 3 ] || die "usage: dot merge-lazylock <base> <current> <other>"
+  local gitdir local_f incoming_f
+  gitdir=$(git rev-parse --absolute-git-dir)
+  if [ -d "$gitdir/rebase-merge" ] || [ -d "$gitdir/rebase-apply" ]; then
+    incoming_f=$2; local_f=$3
+  else
+    incoming_f=$3; local_f=$2
+  fi
+  jq -nr --slurpfile b "$1" --slurpfile l "$local_f" --slurpfile i "$incoming_f" '
+    ($b[0] // {}) as $b | ($l[0] // {}) as $l | ($i[0] // {}) as $i
+    | ([$b, $l, $i] | map(keys) | add | unique) as $names
+    | reduce $names[] as $n ({};
+        ($b[$n]) as $o | ($l[$n]) as $x | ($i[$n]) as $y
+        | (if $x == $o then $y elif $y == $o then $x else $y end) as $v
+        | if $v == null then . else .[$n] = $v end)
+    | if length == 0 then "{}" else
+        to_entries
+        | map("  " + (.key | tojson) + ": { "
+              + (.value | to_entries | map((.key | tojson) + ": " + (.value | tojson)) | join(", "))
+              + " }")
+        | "{\n" + join(",\n") + "\n}" end' >"$2.dot-merge" || { rm -f "$2.dot-merge"; return 1; }
+  mv -f "$2.dot-merge" "$2"
+}
+
+# dot pull: fetch, check signatures, back up, apply, link.
+cmd_pull() {
+  [ $# -eq 0 ] || die "usage: dot pull"
+  mark_running pull
+  local steps=("fetch:Fetch from GitHub" "verify:Check signatures" "backup:Save a backup")
+  job_begin pull "${steps[@]}" "apply:Apply commits" "link:Link files and run hooks"
+  JOB_STOP_MSG="Nothing was changed."
+  job_expect pull
+  merge_drivers
+  local mode="${DOT_PULL_MODE:-rebase}" overlap conflicts stashes d="${DOT/#$HOME/\~}" n f
+  case "$mode" in rebase|ff-only|merge) ;; *) die "DOT_PULL_MODE must be rebase|merge|ff-only" ;; esac
+
+  job_step fetch run
+  git -C "$DOT" fetch -q || die "dot pull: couldn't reach GitHub, so nothing was pulled.
+Check the network, or whether the ssh agent has keys ('dot doctor'), then try again."
+  job_step fetch ok
+
+  n=$(git -C "$DOT" rev-list --count 'HEAD..@{u}')
+  if [ "$n" = 0 ]; then
+    dim "dot pull: already up to date"
+    JOB_OK="Already up to date"
+    job_stoppable false
+    job_step verify skip; job_step backup skip; job_step apply skip
+  else
+    job_label verify "Check signatures ($n commit$([ "$n" = 1 ] || echo s))"
+    job_label apply "Apply $n commit$([ "$n" = 1 ] || echo s)"
+    JOB_OK="Pulled $n commit$([ "$n" = 1 ] || echo s)"
+    job_step verify run
+    verify_incoming
+    overlap=$(comm -12 \
+      <(git -C "$DOT" diff --name-only 'HEAD...@{u}' | sort -u) \
+      <({ git -C "$DOT" diff --name-only HEAD; git -C "$DOT" ls-files --others --exclude-standard; } | sort -u) \
+      | without_merge_rule)
+    if [ -n "$overlap" ]; then
+      warn "dot pull: stopped. You have uncommitted edits to files the incoming changes also change:"
+      printf '  %s\n' $overlap >&2
+      for f in $overlap; do job_detail "$f"; done
+      JOB_MSG="Your uncommitted edits touch incoming files."
+      die "Nothing was changed. Commit or undo those edits, then run 'dot pull' again.
+See the incoming change:  git -C $d diff HEAD...@{u} -- <file>"
+    fi
+
+    job_step verify ok
+    job_stoppable false
+
+    pull_head=$(git -C "$DOT" rev-parse HEAD); pull_up=$(git -C "$DOT" rev-parse '@{u}')
+    if ! is_worktree; then
+      job_step backup run
+      save_backup
+      dim "dot pull: saved where you were as backup $saved_backup (dot undo)"
+      job_step backup ok
+    else job_step backup skip; fi
+    job_step apply run
+
+    case "$mode" in
+      rebase)
+        stashes=$(git -C "$DOT" stash list | wc -l)
+        if ! git -C "$DOT" rebase -q --autostash '@{u}' >/dev/null 2>&1; then
+          conflicts=$(git -C "$DOT" diff --name-only --diff-filter=U)
+          # shellcheck disable=SC2086
+          is_worktree || capture_conflict rebase $conflicts
+          git -C "$DOT" rebase --abort
+          warn "dot pull: stopped. Commits on this PC and the incoming ones both change:"
+          printf '  %s\n' $conflicts >&2
+          for f in $conflicts; do job_detail "$f"; done
+          JOB_MSG="Both PCs changed the same lines. Nothing was changed."
+          die "Nothing was changed: the repo is back where it was before the pull.
+Solve it with Claude (in a separate copy):  dot resolve
+Or by hand:  git -C $d rebase @{u}"
+        fi
+        if [ "$(git -C "$DOT" stash list | wc -l)" -gt "$stashes" ]; then
+          warn "dot pull: pulled, but your uncommitted edits didn't fit back on top. They are safe in the stash:
+  git -C $d stash show -p    then    git -C $d stash pop"
+        fi ;;
+      ff-only)
+        git -C "$DOT" merge -q --ff-only '@{u}' 2>/dev/null || die "dot pull: can't fast-forward, because this PC also has new commits. Nothing was changed.
+Put yours on top of the incoming ones:  DOT_PULL_MODE=rebase dot pull" ;;
+      merge)
+        if ! git -C "$DOT" merge -q --no-edit '@{u}' >/dev/null 2>&1; then
+          conflicts=$(git -C "$DOT" diff --name-only --diff-filter=U)
+          # shellcheck disable=SC2086
+          is_worktree || capture_conflict merge $conflicts
+          git -C "$DOT" merge --abort
+          warn "dot pull: stopped. Commits on this PC and the incoming ones both change:"
+          printf '  %s\n' $conflicts >&2
+          for f in $conflicts; do job_detail "$f"; done
+          JOB_MSG="Both PCs changed the same lines. Nothing was changed."
+          die "Nothing was changed: the repo is back where it was before the pull."
+        fi ;;
+    esac
+    job_step apply ok
+  fi
+  if is_worktree; then dim "dot pull: git worktree, so nothing was linked"; job_step link skip
+  else
+    close_conflicts
+    job_step link run
+    cmd_link 2>&1 | job_lines || die "dot pull: pulled, but linking failed. See the log above."
+    job_step link ok
+  fi
+}
+
+cmd_push() {
+  local msg="" check=1 paths=() p rp base
+  local usage="usage: dot push [-m <msg>] [--no-check] [-- <path>...]"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -m) [ $# -ge 2 ] || die "$usage"; msg="$2"; shift 2 ;;
+      --no-check) check=0; shift ;;
+      --) shift
+          # only these paths are added, checked and committed; others' edits stay as they are
+          for p in "$@"; do
+            rp=$(realpath -m -- "$p")
+            [[ $rp == "$DOT" || $rp == "$DOT"/* ]] || die "dot push: $p isn't inside $DOT"
+            [ "$rp" != "$DOT" ] || die "dot push: name paths inside $DOT, or leave out -- to push everything"
+            paths+=("${rp#"$DOT"/}")
+          done
+          [ ${#paths[@]} -gt 0 ] || die "$usage"
+          set -- ;;
+      *) die "$usage" ;;
+    esac
+  done
+  mark_running push
+  job_begin push "checks:Secrets and lint" "tests:Tests" "commit:Commit" "push:Push"
+  JOB_STOP_MSG="Nothing was committed or pushed."
+  if [ ${#paths[@]} -gt 0 ]; then
+    git -C "$DOT" add -A -- "${paths[@]}"
+    base=$(git -C "$DOT" merge-base HEAD '@{u}' 2>/dev/null) || base=HEAD
+    local CHECK_FILES
+    CHECK_FILES=$( { git -C "$DOT" diff --cached --name-only --diff-filter=d -- "${paths[@]}"; git -C "$DOT" diff --name-only --diff-filter=d "$base" HEAD; } | sort -u)
+  else
+    git -C "$DOT" add -A
+  fi
+  if [ $check = 0 ]; then
+    warn "dot push: checks skipped (--no-check)"
+    job_step checks skip; job_step tests skip; job_expect push
+  elif ! cmd_check; then
+    die "dot push: stopped by the check above. Nothing was committed or pushed.
+Fix it and run 'dot push' again, or skip the checks once:  dot push --no-check"
+  fi
+  local n ahead
+  n=$(git -C "$DOT" diff --cached --name-only -- "${paths[@]}" | wc -l)
+  job_stoppable false
+  if [ "$n" = 0 ]; then
+    dim "dot: nothing to commit"
+    job_step commit skip
+  else
+    job_label commit "Commit $n file$([ "$n" = 1 ] || echo s)"
+    job_step commit run
+    if [ -z "$msg" ]; then
+      local host areas
+      host=$(this_host)
+      areas=$(git -C "$DOT" diff --cached --name-only -- "${paths[@]}" | cut -d/ -f1 | sort -u | paste -sd' ' -)
+      msg="sync($host): $areas — $(date '+%Y-%m-%d %H:%M')"
+    fi
+    git -C "$DOT" commit -q -m "$msg" --trailer "Dot-Host: $(this_host)" -- "${paths[@]}"
+    dim "dot: committed  $msg"
+    job_step commit ok
+  fi
+  local up=()
+  git -C "$DOT" rev-parse -q --verify '@{u}' >/dev/null 2>&1 || up=(-u origin HEAD)
+  ahead=$(git -C "$DOT" rev-list --count '@{u}..HEAD' 2>/dev/null || git -C "$DOT" rev-list --count HEAD)
+  if [ "$n" != 0 ]; then JOB_OK="Shared $n file$([ "$n" = 1 ] || echo s)"
+  elif [ "$ahead" != 0 ]; then JOB_OK="Shared $ahead commit$([ "$ahead" = 1 ] || echo s)"
+  else JOB_OK="Nothing to share"; fi
+  job_step push run
+  if git -C "$DOT" push "${up[@]}"; then
+    dim "dot: pushed"
+    job_step push ok
+  else
+    die "dot: push rejected — run 'dot pull' first, then 'dot push' again"
+  fi
+}
+
+cmd_undo() {
+  no_worktree undo
+  local yes=0 pick="" name="" names d="${DOT/#$HOME/\~}" i=0 n subj ans gitdir
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -y) yes=1; shift ;;
+      -*) die "usage: dot undo [<number>|<backup>] [-y]" ;;
+      *) [ -z "$pick" ] || die "usage: dot undo [<number>|<backup>] [-y]"; pick="$1"; shift ;;
+    esac
+  done
+  names=$(backup_names)
+  [ -n "$names" ] || die "dot undo: no backups yet. dot pull saves one each time before it changes anything."
+
+  if [ -z "$pick" ]; then
+    echo "Backups (dot pull saves one before it changes anything; newest first):"
+    while read -r n; do
+      i=$((i + 1))
+      subj=$(git -C "$DOT" log -1 --format='%h  %s' "$BACKUP_NS/$n")
+      printf '  %2d  %s  %s' "$i" "$(backup_when "$n")" "$subj"
+      git -C "$DOT" show-ref -q --verify "$BACKUP_NS/$n-wip" && printf '  (+ uncommitted edits)'
+      printf '\n'
+    done <<<"$names"
+    dim "Go back to one:  dot undo <number>"
+    return 0
+  fi
+
+  case "$pick" in
+    *[!0-9]*) grep -qxF -- "$pick" <<<"$names" && name=$pick ;;
+    *) name=$(sed -n "${pick}p" <<<"$names") ;;
+  esac
+  [ -n "$name" ] || die "dot undo: no backup '$pick'. See the list:  dot undo"
+
+  gitdir=$(git -C "$DOT" rev-parse --absolute-git-dir)
+  if [ -d "$gitdir/rebase-merge" ] || [ -d "$gitdir/rebase-apply" ] || [ -f "$gitdir/MERGE_HEAD" ]; then
+    die "dot undo: a pull or merge is half done in $d. Finish or abort it first (git -C $d rebase --abort)."
+  fi
+
+  echo "Go back to $(backup_when "$name"):"
+  if [ "$(git -C "$DOT" rev-list --count "$BACKUP_NS/$name..HEAD")" -gt 0 ]; then
+    echo "  these commits leave this PC (they stay on GitHub, or in the backup made now):"
+    git -C "$DOT" log --format='    %h  %s' "$BACKUP_NS/$name..HEAD"
+  fi
+  if [ -n "$(git -C "$DOT" status --porcelain)" ]; then
+    echo "  your uncommitted edits are saved in the backup made now:"
+    git -C "$DOT" status --short | sed 's/^/    /'
+  fi
+  if [ $yes = 0 ]; then
+    read -r -p "Go back? [y/N] " ans || ans=""
+    case "$ans" in y|Y|yes) ;; *) dim "dot undo: nothing changed"; return 0 ;; esac
+  fi
+
+  mark_running undo
+  save_backup
+  git -C "$DOT" reset -q --hard "$BACKUP_NS/$name"
+  if git -C "$DOT" show-ref -q --verify "$BACKUP_NS/$name-wip" &&
+     ! git -C "$DOT" stash apply -q "$BACKUP_NS/$name-wip" >/dev/null 2>&1; then
+    warn "dot undo: the uncommitted edits from that backup didn't apply cleanly. See them:  git -C $d stash show -p $BACKUP_NS/$name-wip"
+  fi
+  dim "dot undo: back at $(backup_when "$name"). What you had a moment ago is backup $saved_backup."
+  dim "This only changed this PC. Newer commits on GitHub come back with the next dot pull."
+  cmd_link
+}
+
+# dot resolve            replay the stopped pull in $DOT-resolve and start Claude there
+# dot resolve --show     Claude's explanation + the diff, then offer to accept
+# dot resolve --accept   check the fix (signed, no markers, dot check), apply it here
+# dot resolve --drop     throw the fix away (the conflict stays open)
+cmd_resolve() {
+  no_worktree resolve
+  local action=start dir at upstream head wt="$DOT-resolve" d="${DOT/#$HOME/\~}" ans
+  case "${1:-}" in
+    "") ;; --show) action=show ;; --accept) action=accept ;; --drop) action=drop ;;
+    *) die "usage: dot resolve [--show|--accept|--drop]" ;;
+  esac
+  if ! dir=$(open_conflict); then
+    [ "$action" = drop ] && [ -d "$wt" ] || die "dot resolve: no stopped pull to solve. (dot pull saves one when commits clash.)"
+  fi
+  if [ -n "${dir:-}" ]; then
+    at=$(jq -r .at "$dir/info.json"); upstream=$(jq -r .upstream "$dir/info.json"); head=$(jq -r .head "$dir/info.json")
+  fi
+
+  case "$action" in
+    start)
+      if [ -d "$wt" ]; then
+        [ "$(git -C "$wt" branch --show-current 2>/dev/null)" = "resolve/$at" ] || [ -d "$(git -C "$wt" rev-parse --git-path rebase-merge 2>/dev/null)" ] ||
+          die "dot resolve: $wt holds an older fix. Drop it first:  dot resolve --drop"
+        dim "dot resolve: going on in $wt"
+      else
+        git -C "$DOT" worktree add -q -b "resolve/$at" "$wt" "$head" || die "dot resolve: couldn't make the working copy $wt"
+        git -C "$wt" branch -q --set-upstream-to="$(git -C "$DOT" rev-parse --abbrev-ref '@{u}')" 2>/dev/null || true
+        merge_drivers
+        if git -C "$wt" rebase -q "$upstream" >/dev/null 2>&1; then
+          dim "dot resolve: the pull goes through now (something changed since it stopped). Nothing for Claude to do."
+          resolve_offer; return 0
+        fi
+        dim "Saved both sides in $dir"
+        dim "Working copy: $wt (branch resolve/$at). Your live config in $d isn't touched."
+      fi
+      have "${DOT_CLAUDE:-claude}" || die "dot resolve: no claude here. Solve it by hand in $wt, then:  dot resolve --accept"
+      echo "Starting Claude there with the conflict and the rules (only these files, keep per-PC settings apart, explain, never push)."
+      (cd "$wt" && "${DOT_CLAUDE:-claude}" "$(cat "$dir/prompt.md")") || true
+      if resolve_ready; then resolve_offer
+      else dim "Not finished yet. Go on later:  dot resolve   (or drop it:  dot resolve --drop)"; fi ;;
+    show)
+      resolve_ready || die "dot resolve: no finished fix yet. Start or go on with:  dot resolve"
+      resolve_offer ;;
+    accept)
+      resolve_accept ;;
+    drop)
+      if [ -d "$wt" ]; then
+        git -C "$wt" rebase --abort >/dev/null 2>&1 || true
+        local branch; branch=$(git -C "$wt" branch --show-current 2>/dev/null || true)
+        git -C "$DOT" worktree remove --force "$wt"
+        [ -n "$branch" ] && git -C "$DOT" branch -q -D "$branch" 2>/dev/null || true
+      fi
+      rm -f "${dir:-/nonexistent}/RESOLUTION.md"
+      dim "dot resolve: dropped the fix. Nothing in $d changed. The pull is still stopped:  dot resolve  to try again, or dot pull." ;;
+  esac
+}
+
+# the fix in the worktree is finished: no rebase going on, upstream included
+resolve_ready() {
+  local wt="$DOT-resolve"
+  [ -d "$wt" ] || return 1
+  [ ! -d "$(git -C "$wt" rev-parse --git-path rebase-merge)" ] && [ ! -d "$(git -C "$wt" rev-parse --git-path rebase-apply)" ] &&
+    git -C "$wt" merge-base --is-ancestor "$upstream" HEAD
+}
+
+resolve_offer() {
+  local wt="$DOT-resolve" ans
+  echo
+  if [ -s "$dir/RESOLUTION.md" ]; then echo "Claude's explanation:"; sed 's/^/  /' "$dir/RESOLUTION.md"; echo; fi
+  if [ -t 1 ]; then
+    dim "The fix opens in less (q to come back)."
+    git -C "$wt" -c color.ui=always log -p --format='commit %h  %s' "$upstream..HEAD" | less -R
+  else
+    git -C "$wt" --no-pager log -p --format='commit %h  %s' "$upstream..HEAD"
+  fi
+  read -r -p "Accept this fix? [y/N] " ans || ans=""
+  case "$ans" in
+    y|Y|yes) resolve_accept ;;
+    *) dim "Not accepted. Later:  dot resolve --accept   or drop it:  dot resolve --drop" ;;
+  esac
+}
+
+resolve_accept() {
+  local wt="$DOT-resolve" signers_tmp bad marks d="${DOT/#$HOME/\~}" new
+  [ -d "$wt" ] || die "dot resolve: nothing to accept. Start with:  dot resolve"
+  resolve_ready || die "dot resolve: the fix isn't finished (the rebase in $wt is still going). Go on with:  dot resolve"
+  [ "$(git -C "$DOT" rev-parse HEAD)" = "$head" ] ||
+    die "dot resolve: $d has new commits since the pull stopped, so this fix is out of date. Drop it and pull again:  dot resolve --drop && dot pull"
+  marks=$(git -C "$wt" diff "$upstream" HEAD | grep -nE '^\+(<{7}|>{7}|={7})( |$)' || true)
+  [ -z "$marks" ] || die "dot resolve: the fix still has conflict markers. Nothing was applied:
+$marks"
+  head_signers || die "dot resolve: no committed allowed_signers here, so the fix can't be checked. Nothing was applied."
+  bad=$(git -C "$wt" -c gpg.ssh.allowedSignersFile="$signers_tmp" log --format='%G? %h %s' "$upstream..HEAD" | grep -v '^G ' || true)
+  rm -f "$signers_tmp"
+  [ -z "$bad" ] || die "dot resolve: these commits in the fix aren't signed by a key this PC trusts. Nothing was applied:
+$bad"
+  echo "Checking the fix (dot check):"
+  DOTFILES="$wt" "$(readlink -f "$0")" check || die "dot resolve: the fix didn't pass dot check. Nothing was applied. Fix it in $wt, or drop it."
+  new=$(git -C "$wt" rev-parse HEAD)
+  mark_running pull
+  save_backup
+  dim "dot resolve: saved where you were as backup $saved_backup (dot undo)"
+  # the fix is this PC's commits replayed onto the incoming ones (what the pull
+  # would have done), and HEAD hasn't moved since, so move the branch there;
+  # --keep stops instead of touching uncommitted edits in the way
+  git -C "$DOT" reset -q --keep "$new" || die "dot resolve: your uncommitted edits are in the way of the fix. Nothing was changed. Commit or undo them, then:  dot resolve --accept"
+  git -C "$DOT" worktree remove --force "$wt"
+  git -C "$DOT" branch -q -D "resolve/$at" 2>/dev/null || true
+  close_conflicts
+  cmd_link
+  printf '%s%s%s\n' "$c_grn" "Fix applied. Share it with:  dot push" "$c_rst"
+}
+
+# Everything `dot push` would share from this PC: edits to tracked files, new
+# files, and commits not pushed yet. `dot share-from` runs it over ssh.
+cmd_diff() {
+  local color=never f
+  [ "${1:-}" = "--color" ] && color=always
+  git -C "$DOT" --no-pager -c color.ui=$color diff HEAD
+  while IFS= read -r -d '' f; do
+    (cd "$DOT" && git --no-pager -c color.ui=$color diff --no-index -- /dev/null "$f") || true
+  done < <(git -C "$DOT" ls-files --others --exclude-standard -z)
+  if git -C "$DOT" rev-parse -q --verify '@{u}' >/dev/null 2>&1 &&
+     [ "$(git -C "$DOT" rev-list --count '@{u}..HEAD')" -gt 0 ]; then
+    git -C "$DOT" --no-pager -c color.ui=$color log -p --format='commit %h  %s' '@{u}..HEAD'
+  fi
+}
+
+# Share what another PC has, from here: fresh list over ssh, the diff, y/N, then
+# `dot pull` + `dot push` on that PC (its checks, its signing key). Never pulls
+# here. The PC name and ssh alias come from system/hosts/pcs.txt only.
+# --json: the list as JSON, with a token for what it showed;
+# --diff: only the full diff; --expect <token>: share only if the list is still
+# that one (so -y too).
+cmd_share_from() {
+  local want="" yes=0 mode="" expect="" me name alias pcname="" pcalias="" others=() st fp fp2 rc ans token
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      -y) yes=1; shift ;;
+      --json|--diff) mode=${1#--}; shift ;;
+      --expect) [[ ${2:-} =~ ^[0-9a-f]{40}$ ]] || die "dot share-from: --expect needs the token from --json"; expect=$2; yes=1; shift 2 ;;
+      -*) die "usage: dot share-from [<pc>] [-y] [--json|--diff|--expect <token>]" ;;
+      *) [ -z "$want" ] || die "usage: dot share-from [<pc>] [-y]"; want="$1"; shift ;;
+    esac
+  done
+  [ -z "$want" ] || [[ $want =~ ^[A-Za-z0-9-]+$ ]] || die "dot share-from: '$want' isn't a PC name"
+  me=$(this_host)
+  [[ $me =~ ^[A-Za-z0-9-]+$ ]] || die "dot share-from: this PC's name looks wrong: '$me'"
+  while read -r name alias _; do
+    case "$name" in ""|"#"*) continue ;; esac
+    [ "${name,,}" = "${me,,}" ] && continue
+    others+=("$name")
+    if [ -n "$want" ] && [ "${name,,}" = "${want,,}" ]; then pcname=$name; pcalias=$alias; fi
+    if [ -z "$want" ]; then pcname=$name; pcalias=$alias; fi
+  done < <(cat "$DOT/system/hosts/pcs.txt" 2>/dev/null || true)
+  [ ${#others[@]} -gt 0 ] || die "dot share-from: no other PC in system/hosts/pcs.txt"
+  if [ -z "$want" ] && [ ${#others[@]} -gt 1 ]; then die "dot share-from: which PC? ${others[*]}"; fi
+  [ -n "$pcname" ] || die "dot share-from: no PC named '$want' in system/hosts/pcs.txt (${others[*]})"
+  [[ $pcalias =~ ^[A-Za-z0-9._-]+$ ]] || die "dot share-from: the ssh alias for $pcname in pcs.txt looks wrong: '$pcalias'"
+
+  on_pc() { ssh -o BatchMode=yes -o ConnectTimeout=5 "$pcalias" "$@"; }
+  pc_status() {
+    if st=$(on_pc '$HOME/.local/bin/dot status --json' 2>/dev/null); then rc=0; else rc=$?; fi
+    [ "$rc" != 255 ] || die "dot share-from: can't reach $pcname (asleep or offline?). Nothing was shared."
+    jq -e '.schema == 1' >/dev/null 2>&1 <<<"$st" || die "dot share-from: $pcname runs an older dot. Pull there first. Nothing was shared."
+    if jq -e '.error' >/dev/null <<<"$st"; then die "dot share-from: $pcname can't read its repo ($(jq -r .error <<<"$st")). Nothing was shared."; fi
+    if jq -e '.running' >/dev/null <<<"$st"; then die "dot share-from: $pcname is running dot $(jq -r .running <<<"$st") right now. Try again in a moment."; fi
+    if jq -e '.operation != null or .state == "conflict"' >/dev/null <<<"$st"; then
+      die "dot share-from: a pull is half done on $pcname. Finish it there first. Nothing was shared."
+    fi
+  }
+  fingerprint() { jq -c '[[.dirty[] | [.path, .kind, .changedAt]], .ahead]' <<<"$1"; }
+
+  if [ "$mode" = diff ]; then
+    if [ -t 1 ]; then on_pc '$HOME/.local/bin/dot diff --color' | less -R; else on_pc '$HOME/.local/bin/dot diff'; fi
+    return 0
+  fi
+
+  pc_status
+  fp=$(fingerprint "$st")
+  token=$(printf '%s' "$fp" | sha1sum | cut -c1-40)
+  if [ "$mode" = json ]; then
+    jq -c --arg pc "$pcname" --arg token "$token" '.generatedAt as $now | {schema: 1, pc: $pc, token: $token,
+      files: [.dirty[] | {path, kind, ageSec: (if .changedAt and $now then $now - .changedAt else null end)}],
+      commits: [.outgoing[]?.subject]}' <<<"$st"
+    return 0
+  fi
+  if jq -e '(.dirty | length) == 0 and .ahead == 0' >/dev/null <<<"$st"; then
+    dim "dot share-from: $pcname has nothing to share"; return 0
+  fi
+  if [ -n "$expect" ]; then
+    [ "$token" = "$expect" ] || die "dot share-from: $pcname changed since you looked. Nothing was shared. Look again."
+  else
+    jq -r '
+      def age: if . == null then "" elif . < 90 then "now" elif . < 3600 then "\(. / 60 | round) min ago"
+        elif . < 172800 then "\(. / 3600 | round) h ago" else "\(. / 86400 | round) d ago" end;
+      .generatedAt as $now
+      | (if (.dirty | length) > 0 then
+          "\(.host) has \(.dirty | length) changed file\(if (.dirty | length) == 1 then "" else "s" end):",
+          (.dirty[] | ((if .changedAt then $now - .changedAt else null end) as $a
+            | "  \(.path)  \(if .kind == "modified" then "changed" else .kind end)"
+              + (if $a == null then "" else "  " + ($a | age) end)
+              + (if $a != null and $a < 300 then "   <- changed in the last 5 min, maybe still open" else "" end)))
+         else empty end),
+        (if .ahead > 0 then "\(.host) has \(.ahead) commit\(if .ahead == 1 then "" else "s" end) not pushed:", (.outgoing[] | "  \(.subject)") else empty end)
+    ' <<<"$st"
+    echo
+    if [ -t 1 ]; then
+      dim "The full diff opens in less (q to come back)."
+      on_pc '$HOME/.local/bin/dot diff --color' | less -R
+    else
+      on_pc '$HOME/.local/bin/dot diff'
+    fi
+  fi
+
+  if [ $yes = 0 ]; then
+    read -r -p "Share all of this from $pcname? [y/N] " ans || ans=""
+    case "$ans" in y|Y|yes) ;; *) dim "dot share-from: nothing was shared"; return 0 ;; esac
+  fi
+
+  job_begin sharefrom "reach:Check $pcname" "pull:Pull on $pcname" "checks:Secrets and lint" "tests:Tests" "commit:Commit" "push:Push"
+  job_write --arg pc "$pcname" --arg me "$me" '.host = $pc | .by = $me'
+  JOB_REMOTE=$pcalias
+  trap 'job_finish $?' EXIT
+  JOB_STOP_MSG="Nothing was shared from $pcname."
+  job_expect sharefrom
+  job_step reach run
+  pc_status
+  fp2=$(fingerprint "$st")
+  if [ "$fp" != "$fp2" ]; then
+    job_step reach fail
+    die "dot share-from: $pcname changed while you were looking. Nothing was shared. Run it again to see the new list."
+  fi
+  job_step reach ok
+
+  dim "$pcname: dot pull"
+  job_step pull run
+  if ! remote_job pull; then
+    JOB_MSG="$pcname couldn't pull first${JOB_REMOTE_SUMMARY:+: ${JOB_REMOTE_SUMMARY%.}}. Nothing was shared."
+    die "dot share-from: $pcname couldn't pull first (see above). Nothing was shared from $pcname."
+  fi
+  job_step pull ok
+  job_stoppable true
+  dim "$pcname: dot push"
+  if ! remote_job push; then
+    JOB_MSG="On $pcname: ${JOB_REMOTE_SUMMARY:-dot push stopped}"
+    die "dot share-from: dot push stopped on $pcname (see above). Nothing was pushed."
+  fi
+  JOB_OK="${JOB_REMOTE_SUMMARY:-Shared} from $pcname"
+  printf '%s%s%s\n' "$c_grn" "Shared from $pcname. Pull here when you're ready: dot pull." "$c_rst"
+}
+
+# remote_job <pull|push>: dot <it> on the share-from PC (marked as started from
+# here), its job.json copied into this one every 2 s: the push's own steps and
+# test count, the newest line, what failed, and whether stopping is still safe.
+remote_job() {
+  local what=$1 t0 rpid rc=0
+  t0=$(date +%s)
+  JOB_REMOTE_SUMMARY=""
+  on_pc "DOT_JOB_BY=$me \$HOME/.local/bin/dot $what" </dev/null &
+  rpid=$!
+  while kill -0 "$rpid" 2>/dev/null; do sleep 2; remote_mirror "$what" "$t0"; done
+  wait "$rpid" || rc=$?
+  remote_mirror "$what" "$t0"
+  return "$rc"
+}
+
+remote_mirror() {
+  local rj
+  rj=$(on_pc '$HOME/.local/bin/dot job --json' 2>/dev/null) || return 0
+  # its own job, started by this one (clocks may differ a little)
+  jq -e --arg by "$me" --arg a "$1" --argjson t "$(($2 - 120))" \
+    '.schema == 1 and .action == $a and .by == $by and (.startedAt // 0) >= $t' >/dev/null 2>&1 <<<"$rj" || return 0
+  JOB_REMOTE_SUMMARY=$(jq -r '.summary // ""' <<<"$rj" | sed 's/^Stopped\. *//')
+  if [ "$1" = push ]; then
+    job_write --argjson r "$rj" '.steps = (.steps[0:2] + [$r.steps[] | {id, label, state, startedAt, endedAt, done, total}])
+      | .line = ($r.line // "") | .details = ($r.details // []) | .stoppable = ($r.stoppable == true)'
+  else
+    job_write --argjson r "$rj" '.line = ($r.line // "") | .details = ($r.details // []) | .stoppable = ($r.stoppable == true)'
+  fi
+  return 0
+}
+
+cmd_add() {
+  no_worktree add
+  [ $# -eq 2 ] || die "usage: dot add <pkg> <path>   (path relative to \$HOME, or absolute)"
+  local pkg="$1" arg="$2" src rel dst
+  case "$arg" in
+    /*) ;;
+    ~/*) arg="$HOME/${arg#\~/}" ;;
+    *)  arg="$TARGET/$arg" ;;
+  esac
+  src=$(readlink -f -- "$arg") || die "no such path: $2"
+  [ -e "$src" ] || die "no such path: $2"
+  case "$src" in
+    "$TARGET"/*) ;;
+    *) die "path must be under $TARGET" ;;
+  esac
+  if [[ $pkg == host-* && $pkg != "$(host_pkg)" ]]; then
+    die "dot add: $pkg is only linked on ${pkg#host-}. This PC's own package is $(host_pkg)."
+  fi
+  [ -d "$DOT/$pkg" ] || die "no such package: $pkg  (mkdir $DOT/$pkg to create one)"
+  rel="${src#"$TARGET"/}"
+  dst="$DOT/$pkg/$rel"
+  [ -e "$dst" ] && die "already in the repo: $dst"
+  mkdir -p "$(dirname "$dst")"
+  mv -- "$src" "$dst"
+  local flags=()
+  mapfile -t flags < <(stow_flags "$pkg")
+  stow -R "${flags[@]}" -d "$DOT" -t "$TARGET" "$pkg"
+  dim "adopted $rel into $pkg  (now a symlink)"
+}
+
+# A shared file becomes this PC's own: its current content (edits included) is
+# copied into host-<this PC>, the shared file goes back to the committed
+# version, and one local signed commit records it. Nothing is pushed.
+cmd_keep_here() {
+  no_worktree keep-here
+  [ $# -eq 1 ] || die "usage: dot keep-here <path>   (path relative to \$HOME, or absolute)"
+  local arg="$1" src rest pkg rel dst hp gitdir tracked=0
+  case "$arg" in
+    /*) ;;
+    ~/*) arg="$HOME/${arg#\~/}" ;;
+    *)  arg="$TARGET/$arg" ;;
+  esac
+  src=$(readlink -f -- "$arg") || die "no such path: $1"
+  [ -e "$src" ] || die "no such path: $1"
+  [ -f "$src" ] || die "dot keep-here: $1 is not a file. Keep one file at a time."
+  case "$src" in
+    "$DOT"/*/*) ;;
+    *) die "dot keep-here: $1 isn't from the dotfiles repo. Add it with: dot add $(host_pkg) $1" ;;
+  esac
+  rest=${src#"$DOT"/}; pkg=${rest%%/*}; rel=${rest#*/}
+  hp=$(host_pkg)
+  [ "$pkg" = "$hp" ] && die "dot keep-here: $rel is already this PC's own ($hp)."
+  [[ $pkg == host-* ]] && die "dot keep-here: $1 belongs to ${pkg#host-}, not this PC ($(this_host))."
+  grep -qxF "$pkg" < <(discover) || die "dot keep-here: $pkg isn't a linked package here."
+  dst="$DOT/$hp/$rel"
+  [ -e "$dst" ] && die "dot keep-here: $hp already has $rel."
+  gitdir=$(git -C "$DOT" rev-parse --absolute-git-dir)
+  if [ -d "$gitdir/rebase-merge" ] || [ -d "$gitdir/rebase-apply" ] || [ -f "$gitdir/MERGE_HEAD" ]; then
+    die "dot keep-here: a pull is half done. Finish it first ('dot resolve' or 'dot undo')."
+  fi
+  git -C "$DOT" ls-files --error-unmatch -- "$pkg/$rel" >/dev/null 2>&1 && tracked=1
+
+  mkdir -p "$(dirname "$dst")"
+  cp -p -- "$src" "$dst"
+  if [ $tracked = 1 ]; then git -C "$DOT" restore --source=HEAD --staged --worktree -- "$pkg/$rel"
+  else rm -f -- "$src"; fi
+  stow_pkgs "$pkg" "$hp"
+  [ "$(readlink -f -- "$TARGET/$rel")" = "$dst" ] || die "dot keep-here: copied to $dst but the link didn't switch — run 'dot doctor'"
+
+  git -C "$DOT" add -- "$hp/$rel"
+  local paths=("$hp/$rel")
+  [ $tracked = 1 ] && paths+=("$pkg/$rel")
+  git -C "$DOT" commit -q -m "keep($(this_host)): $pkg/$rel" -- "${paths[@]}" \
+    || die "dot keep-here: the file is moved, but the commit failed (signing?). Commit it with: dot push"
+  dim "kept $rel on this PC ($hp). The shared one is back to what the other PCs have."
+  dim "Committed here, not pushed."
+}
+
+cmd_edit() { exec "${EDITOR:-vi}" "$DOT"; }
+
+cmd_doctor() {
+  set +e            # a diagnostic — individual checks are expected to fail
+  local rc=0 offline=0
+  case "${1:-}" in
+    --offline) offline=1 ;;
+    "") ;;
+    *) die "usage: dot doctor [--offline]" ;;
+  esac
+  _ok()   { printf '  %s✓%s %s\n'  "$c_grn" "$c_rst" "$*"; }
+  _warn() { printf '  %s!%s %s\n'  "$c_yel" "$c_rst" "$*"; }
+  _bad()  { printf '  %s✗%s %s\n'  "$c_red" "$c_rst" "$*"; rc=1; }
+
+  echo "deps"
+  for t in stow git jq; do have "$t" && _ok "$("$t" --version 2>/dev/null | head -1)" || _bad "$t missing"; done
+
+  echo "packages"
+  local p flags=()
+  while read -r p; do
+    [ -n "$p" ] || continue
+    mapfile -t flags < <(stow_flags "$p")
+    if stow -n -R "${flags[@]}" -d "$DOT" -t "$TARGET" "$p" >/dev/null 2>&1; then _ok "$p"
+    else _bad "$p — stow conflict:  stow -n -R -d $DOT -t $TARGET $p"; fi
+  done < <(discover)
+
+  echo "broken symlinks into repo"
+  # symlinks that point into the repo but no longer resolve. Skip volatile
+  # state/cache trees (mise, etc. keep their own realpath links in there).
+  local broken
+  broken=$(dead_links)
+  if [ -n "$broken" ]; then printf '%s\n' "$broken" | sed 's/^/  ✗ /'; _warn "'dot link' removes these"; rc=1; else _ok "none"; fi
+
+  local ahead behind dirty last
+  if [ "$offline" = 1 ]; then
+    last=$(stat -c %y "$DOT/.git/FETCH_HEAD" 2>/dev/null | cut -d. -f1)
+    echo "git (offline: not fetched, last fetch ${last:-never})"
+  else
+    echo "git"
+    git -C "$DOT" fetch -q 2>/dev/null || _warn "couldn't fetch — numbers below are from the last fetch"
+  fi
+  if read -r behind ahead < <(git -C "$DOT" rev-list --left-right --count '@{u}...HEAD' 2>/dev/null); then
+    [ "$ahead" = 0 ] && [ "$behind" = 0 ] && _ok "in sync with origin" || _warn "$ahead ahead / $behind behind origin"
+  else
+    _warn "no upstream tracking branch"
+  fi
+  dirty=$(git -C "$DOT" status --porcelain | wc -l)
+  [ "$dirty" -eq 0 ] && _ok "working tree clean" || _warn "$dirty uncommitted change(s) — 'dot push' when ready"
+
+  echo "hooks"
+  local h
+  for h in "$DOT"/hooks/post-link.d/*.sh; do
+    [ -e "$h" ] || continue
+    bash -n "$h" 2>/dev/null && _ok "${h##*/}" || _bad "${h##*/} — syntax error"
+  done
+
+  echo "signing"
+  if git -C "$DOT" cat-file -e "HEAD:$SIGNERS" 2>/dev/null; then _ok "$SIGNERS committed (dot pull checks incoming commits against it)"
+  else _bad "no committed $SIGNERS — dot pull refuses every incoming commit until it exists"; fi
+  [ "$(git -C "$DOT" config --bool commit.gpgsign 2>/dev/null)" = true ] \
+    && _ok "commits are signed here" || _warn "commit.gpgsign is off — the other PCs' dot pull will refuse these commits"
+  if [ "$(git -C "$DOT" config gpg.format 2>/dev/null)" = ssh ]; then
+    ssh-add -l >/dev/null 2>&1 && _ok "ssh agent has keys" || _warn "the ssh agent has no keys — signing may fail"
+  fi
+
+  return $rc
+}
+
+cmd_bootstrap() {
+  no_worktree bootstrap
+  [ -d "$DOT/.git" ] || die "no repo at $DOT — clone it first"
+  cmd_link || true
+  echo
+  cmd_doctor || true
+}
+
+usage() { sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; }
+
+# the options of this run, as JSON, for the job file: Try again repeats them
+# exactly (dot job --retry), so a path-limited push never comes back as a full one
+if [ -z "${DOT_JOB_ARGS:-}" ] && have jq; then
+  DOT_JOB_ARGS=$(jq -nc '$ARGS.positional' --args -- "${@:2}" 2>/dev/null) || DOT_JOB_ARGS='[]'
+fi
+
+case "${1:-status}" in
+  status|st)      shift || true; cmd_status "$@" ;;
+  push)           shift; cmd_push "$@" ;;
+  pull)           shift; cmd_pull "$@" ;;
+  start)          shift; cmd_start "$@" ;;
+  stop)           shift; cmd_stop "$@" ;;
+  job)            shift; cmd_job "$@" ;;
+  undo)           shift; cmd_undo "$@" ;;
+  merge-lazylock) shift; cmd_merge_lazylock "$@" ;;
+  diff)           shift; cmd_diff "$@" ;;
+  share-from)     shift; cmd_share_from "$@" ;;
+  resolve)        shift; cmd_resolve "$@" ;;
+  link|relink)    shift; cmd_link "$@" ;;
+  unlink)         shift; cmd_unlink "$@" ;;
+  add)            shift; cmd_add "$@" ;;
+  keep-here)      shift; cmd_keep_here "$@" ;;
+  edit)           shift; cmd_edit "$@" ;;
+  check)          shift; cmd_check "$@" ;;
+  watch)          shift; cmd_watch "$@" ;;
+  pick)           shift; cmd_pick "$@" ;;
+  pick-drop)      shift; cmd_pick_drop "$@" ;;
+  revert)         shift; cmd_revert "$@" ;;
+  drift)          shift; cmd_drift "$@" ;;
+  doctor)         shift; cmd_doctor "$@" ;;
+  bootstrap)      shift; cmd_bootstrap "$@" ;;
+  -h|--help|help) usage ;;
+  *)              usage; exit 1 ;;
+esac

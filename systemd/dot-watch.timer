@@ -1,0 +1,9 @@
+[Unit]
+Description=dot watch every 3 min, and soon after login
+
+[Timer]
+OnStartupSec=1min
+OnUnitActiveSec=3min
+
+[Install]
+WantedBy=timers.target
