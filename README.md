@@ -6,7 +6,10 @@ A command-line tool for people who keep their dotfiles in one git repo of
 
 Checks run on my own PC before every merge: `mise run check`.
 
-<!-- Terminal recording goes here: docs/assets/push-pull.gif (not made yet). -->
+<p align="center"><img src="docs/assets/terminal.png" alt="dot push runs the checks (secrets, shell, json, lua), then commits and pushes. dot pull on the same PC stops at an unsigned commit and changes nothing." width="100%"></p>
+<p align="center"><img src="docs/assets/doctor.png" alt="dot doctor: tools, packages, links, git state and commit signing, each with a check mark." width="100%"></p>
+
+<sub>Real output from a throwaway demo repo.</sub>
 
 ## Why it exists
 
