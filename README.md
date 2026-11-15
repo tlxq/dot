@@ -1,4 +1,7 @@
-<p align="center"><img src="docs/assets/banner.png" alt="dot" width="100%"></p>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/assets/banner-dark.svg">
+  <img alt="dot: Dotfile syncing between Linux PCs." src="docs/assets/banner-light.svg" width="100%">
+</picture>
 
 A command-line tool for people who keep their dotfiles in one git repo of
 [GNU Stow](https://www.gnu.org/software/stow/) packages and use more than one Linux PC. `dot push` on one PC,
